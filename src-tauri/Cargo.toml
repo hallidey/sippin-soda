@@ -1,0 +1,13 @@
+[package]
+name = "sippin-soda-desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+sippin-soda-engine = { path = "../crates/engine" }
