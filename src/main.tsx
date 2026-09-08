@@ -109,7 +109,7 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <span className="local-dot" /> Local-first. Yours by default.
-          <small>v0.1 · HTTP preview</small>
+          <small>v0.1 · Proxy preview</small>
         </div>
       </aside>
       <main>
@@ -123,7 +123,7 @@ function App() {
             {desktop
               ? status
                 ? running
-                  ? "Capturing HTTP"
+                  ? "HTTP + CONNECT active"
                   : "Proxy stopped"
                 : "Connecting to engine…"
               : "UI preview"}
@@ -195,7 +195,7 @@ function App() {
             <h2>Engine</h2>
             <p>
               {desktop
-                ? "The local Rust engine handles HTTP forwarding and capture."
+                ? "The local Rust engine handles HTTP capture and opaque CONNECT tunnels."
                 : "Browser preview. Run npm run desktop to use the native application."}
             </p>
             <dl>
@@ -205,6 +205,8 @@ function App() {
               <dd>{status?.listenAddress ?? "127.0.0.1:8080"}</dd>
               <dt>HTTPS inspection</dt>
               <dd>Not available · no CA installed</dd>
+              <dt>HTTPS pass-through</dt>
+              <dd>CONNECT supported · 5 minute tunnel limit</dd>
               <dt>Production policy</dt>
               <dd>
                 {status?.productionProtection
@@ -235,7 +237,7 @@ function App() {
           <span>
             {desktop ? "Desktop" : "Development preview"}
             <span className="slash">·</span>{" "}
-            {running ? "HTTP proxy active" : "HTTP proxy stopped"}
+            {running ? "HTTP + CONNECT active" : "Proxy stopped"}
           </span>
         </footer>
       </main>

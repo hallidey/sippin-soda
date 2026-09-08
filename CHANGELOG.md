@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add opaque CONNECT tunnels for HTTPS, with bounded lifetimes, live transport byte counts, cancellation and explicit tunnel status in the inspector.
+- Verify early tunnel bytes, half-close, concurrency, invalid targets, loop prevention and end-to-end TLS certificate validation with local fixtures.
 - Add a real explicit HTTP proxy with desktop Start/Stop, streaming forwarding, filtered metadata capture, request selection and native IPC updates.
 - Bound retention and concurrent connections; handle timeouts, cancellation, upstream failures and self-routing.
 - Add a local fixture server and HTTP integration tests.

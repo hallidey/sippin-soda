@@ -5,7 +5,7 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | Requirement | Target | Current state | Exit evidence |
 | --- | --- | --- | --- |
 | Desktop foundation | v0.1 | Tauri/React scaffold, theme settings, honest empty states | UI build; CI native compilation |
-| F01 Observe | v0.1 | HTTP proxy, bounded metadata and native capture events implemented; body inspection/HTTPS pending | Real local client → proxy → upstream tests and Windows desktop smoke test |
+| F01 Observe | v0.1 | HTTP proxy, opaque CONNECT tunnels, bounded metadata and native capture events implemented; body/TLS inspection pending | Real local HTTP/TCP/TLS fixtures; native desktop build |
 | F02 Intercept/modify | v0.1 | Planned | Pause response, change 200 to 500, continue |
 | F03 Replay | v0.1 / v0.3 sessions | Planned | Replay targets local fixture; cancellation and ordering |
 | F04 Rules | v0.1 / v0.3 advanced | Planned | Delay/status rule survives restart |
@@ -20,8 +20,8 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | F13 Scenarios | v0.3 | Planned | Atomic activation/reset with visible conflicts |
 | F14 Protocol extensions | Future | Planned | Per-protocol capability matrix and fixtures |
 | F15 CLI/plugins | v0.4 / future | Planned | Shared policy semantics; headless contract checks |
-| F16 TLS/production safety | v0.1 onward | Initial pure policy; no destination classifier or TLS yet | Actual route/redirect enforcement and TLS fixtures |
+| F16 TLS/production safety | v0.1 onward | Initial pure policy and opaque CONNECT; no destination classifier or TLS interception yet | Pass-through TLS fixtures implemented; actual route enforcement and interception fixtures pending |
 
 ## Next implementation PR
 
-Implement HTTPS CONNECT pass-through as a separately tested milestone, then consent-based CA/TLS inspection. The current HTTP milestone explicitly returns 501 for CONNECT instead of claiming TLS support. Extend request/response body inspection with a bounded redaction design. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
+Extend HTTP request/response body inspection with a bounded redaction design. Prepare consent-based CA/TLS inspection separately from the implemented opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
