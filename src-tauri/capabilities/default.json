@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "The main desktop window has only core Tauri permissions.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
