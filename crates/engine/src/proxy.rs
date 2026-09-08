@@ -1,4 +1,5 @@
 use crate::{EnginePhase, EngineStatus};
+mod tunnel;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Body, Bytes, Frame, Incoming, SizeHint},
@@ -24,6 +25,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
+use tunnel::Tunnel;
 
 type WireBody = BoxBody<Bytes, hyper::Error>;
 
@@ -33,6 +35,7 @@ pub struct ProxyConfig {
     pub capture_limit: usize,
     pub connection_limit: usize,
     pub request_timeout: Duration,
+    pub tunnel_timeout: Duration,
 }
 
 impl Default for ProxyConfig {
@@ -42,6 +45,7 @@ impl Default for ProxyConfig {
             capture_limit: 200,
             connection_limit: 64,
             request_timeout: Duration::from_secs(30),
+            tunnel_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -50,6 +54,7 @@ impl Default for ProxyConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Capture {
     pub id: u64,
+    pub kind: String,
     pub method: String,
     pub target: String,
     pub started_at: u64,
@@ -133,6 +138,8 @@ impl ProxyEngine {
             || config.connection_limit > 256
             || config.request_timeout.is_zero()
             || config.request_timeout > Duration::from_secs(300)
+            || config.tunnel_timeout.is_zero()
+            || config.tunnel_timeout > Duration::from_secs(3600)
         {
             return Err("Invalid proxy resource limits.".into());
         }
@@ -172,12 +179,19 @@ impl ProxyEngine {
                         }
                         let shared = shared.clone();
                         let deadline = config.request_timeout;
+                        let tunnel_deadline = config.tunnel_timeout;
                         connections.spawn(async move {
-                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline));
-                            // One request per connection gives each stream a bounded lifetime.
+                            let (tunnel_tx, mut tunnel_rx) = oneshot::channel::<Tunnel>();
+                            let tunnel_slot = Arc::new(Mutex::new(Some(tunnel_tx)));
+                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone()));
+                            // The same tracked task owns HTTP negotiation AND the tunnel,
+                            // so upgrades cannot escape the connection cap or Stop.
                             let mut builder = http1::Builder::new();
                             builder.keep_alive(false).max_buf_size(32 * 1024).timer(TokioTimer::new()).header_read_timeout(deadline);
-                            let _ = timeout(deadline + Duration::from_secs(1), builder.serve_connection(TokioIo::new(stream), service)).await;
+                            let _ = timeout(deadline + Duration::from_secs(1), builder.serve_connection(TokioIo::new(stream), service).with_upgrades()).await;
+                            if let Ok(tunnel) = tunnel_rx.try_recv() {
+                                tunnel.run(deadline, tunnel_deadline).await;
+                            }
                         });
                     }
                 }
@@ -225,6 +239,9 @@ fn safe_target(request: &Request<Incoming>) -> String {
         .map(|a| a.as_str())
         .unwrap_or("invalid-target");
     let host = host.rsplit('@').next().unwrap_or("invalid-target");
+    if request.method() == Method::CONNECT {
+        return clipped(host, 256);
+    }
     format!(
         "{}{}{}",
         clipped(host, 256),
@@ -388,6 +405,7 @@ async fn handle(
     shared: Shared,
     proxy: SocketAddr,
     deadline: Duration,
+    tunnel_slot: Arc<Mutex<Option<oneshot::Sender<Tunnel>>>>,
 ) -> Result<Response<WireBody>, Infallible> {
     let exchange = {
         let mut state = shared.lock().unwrap();
@@ -399,6 +417,12 @@ async fn handle(
         }
         state.traffic.push_back(Capture {
             id,
+            kind: if request.method() == Method::CONNECT {
+                "tunnel"
+            } else {
+                "http"
+            }
+            .into(),
             method: request.method().to_string(),
             target: safe_target(&request),
             started_at: SystemTime::now()
@@ -422,7 +446,14 @@ async fn handle(
             started: Instant::now(),
         })
     };
-    let outcome = timeout(deadline, forward(request, exchange.clone(), proxy)).await;
+    let operation = async {
+        if request.method() == Method::CONNECT {
+            tunnel::establish(request, exchange.clone(), proxy, tunnel_slot).await
+        } else {
+            forward(request, exchange.clone(), proxy).await
+        }
+    };
+    let outcome = timeout(deadline, operation).await;
     let result = match outcome {
         Ok(Ok(result)) => result,
         Ok(Err((status, message))) => {
@@ -446,10 +477,10 @@ async fn forward(
     exchange: Arc<Exchange>,
     proxy: SocketAddr,
 ) -> Result<Response<WireBody>, ForwardError> {
-    if request.method() == Method::CONNECT || request.headers().contains_key("upgrade") {
+    if request.headers().contains_key("upgrade") {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
-            "HTTPS CONNECT and protocol upgrades are not supported in this HTTP milestone.",
+            "HTTP protocol upgrades are not supported. Use CONNECT for opaque tunnels.",
         ));
     }
     if request.uri().scheme_str() != Some("http") || request.uri().authority().is_none() {
@@ -473,28 +504,7 @@ async fn forward(
         .trim_end_matches(']')
         .to_string();
     let port = request.uri().port_u16().unwrap_or(80);
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream DNS lookup failed."))?
-        .take(16)
-        .collect();
-    if addresses.is_empty() {
-        return Err((StatusCode::BAD_GATEWAY, "No upstream address found."));
-    }
-    // Reject the proxy endpoint after DNS resolution, including aliases.
-    if addresses.iter().any(|address| {
-        address.port() == proxy.port()
-            && (address.ip().to_canonical().is_loopback()
-                || address.ip().to_canonical().is_unspecified())
-    }) {
-        return Err((
-            StatusCode::LOOP_DETECTED,
-            "Routing a request back to this proxy is not allowed.",
-        ));
-    }
-    let stream = TcpStream::connect(addresses.as_slice())
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream connection failed."))?;
+    let stream = connect_upstream(&host, port, proxy).await?;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP handshake failed."))?;
@@ -521,7 +531,6 @@ async fn forward(
             response: false,
         },
     );
-    // This child connection must not outlive the response body or a cancelled request.
     let connection = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -548,6 +557,35 @@ async fn forward(
         _connection: guard,
     };
     Ok(Response::from_parts(parts, body.boxed()))
+}
+
+async fn connect_upstream(
+    host: &str,
+    port: u16,
+    proxy: SocketAddr,
+) -> Result<TcpStream, ForwardError> {
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream DNS lookup failed."))?
+        .take(16)
+        .collect();
+    if addresses.is_empty() {
+        return Err((StatusCode::BAD_GATEWAY, "No upstream address found."));
+    }
+    // Reject the proxy endpoint after DNS resolution, including aliases.
+    if addresses.iter().any(|address| {
+        address.port() == proxy.port()
+            && (address.ip().to_canonical().is_loopback()
+                || address.ip().to_canonical().is_unspecified())
+    }) {
+        return Err((
+            StatusCode::LOOP_DETECTED,
+            "Routing a request back to this proxy is not allowed.",
+        ));
+    }
+    TcpStream::connect(addresses.as_slice())
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream connection failed."))
 }
 
 struct ConnectionGuard(JoinHandle<()>);

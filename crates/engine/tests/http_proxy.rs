@@ -88,11 +88,11 @@ async fn forwards_to_real_upstream_and_captures_only_filtered_metadata() {
 }
 
 #[tokio::test]
-async fn rejects_connect_invalid_targets_and_dns_alias_loops() {
+async fn rejects_upgrades_invalid_targets_and_dns_alias_loops() {
     let (engine, port) = start().await;
     for (request, expected) in [
         (
-            "CONNECT localhost:443 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+            "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n".to_string(),
             "501",
         ),
         (

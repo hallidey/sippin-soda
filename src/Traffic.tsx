@@ -45,7 +45,7 @@ export function Traffic({
         <strong>
           {running
             ? `Listening on ${snapshot.status.listenAddress}`
-            : "Explicit HTTP proxy"}
+            : "HTTP proxy + CONNECT tunnels"}
         </strong>
         <p>
           {desktop
@@ -53,8 +53,8 @@ export function Traffic({
             : "This browser preview cannot start the proxy. Open the desktop app to capture real traffic."}
         </p>
         <p>
-          HTTP only · Metadata in memory · Body recording and HTTPS are not
-          available yet.
+          HTTP metadata + opaque CONNECT tunnels · Memory only · HTTPS content
+          stays encrypted; no CA is installed.
         </p>
       </div>
       <div className="traffic-toolbar">
@@ -114,7 +114,9 @@ export function Traffic({
                 <td>
                   {capture.phase === "error"
                     ? `${capture.status ?? "—"} · Error`
-                    : (capture.status ?? "Pending")}
+                    : capture.kind === "tunnel" && capture.status === 200
+                      ? "200 · Tunnel"
+                      : (capture.status ?? "Pending")}
                 </td>
                 <td>
                   {capture.phase === "pending"
@@ -142,7 +144,7 @@ export function Traffic({
               {query
                 ? "Try a different host, method or status."
                 : running
-                  ? "Send an HTTP request through the proxy configured above."
+                  ? "Send an HTTP or HTTPS request through the proxy configured above."
                   : "Start the proxy in the desktop app, then configure your HTTP client."}
             </p>
             {!query && (
@@ -162,6 +164,13 @@ export function Traffic({
             <h2>
               {selected.method} {selected.target}
             </h2>
+            {selected.kind === "tunnel" && (
+              <p className="capture-notice">
+                Opaque CONNECT tunnel. Status 200 means the tunnel opened;
+                the inner API status, headers and body are not inspected.
+                Byte counts include transport data such as TLS handshakes.
+              </p>
+            )}
             <div className="detail-tabs" aria-label="Inspector view">
               {["Request", "Response", "Timing"].map((name) => (
                 <button
@@ -184,15 +193,18 @@ export function Traffic({
                   {selected.requestBytes.toLocaleString()} bytes forwarded.
                   Query values and non-allowlisted header values are redacted.
                 </p>
+                {selected.kind === "tunnel" && <p>CONNECT negotiation headers only.</p>}
                 <Headers values={selected.requestHeaders} />
               </>
             ) : tab === "Response" ? (
               <>
                 <p>
-                  Status: {selected.status ?? "Waiting"} ·{" "}
+                  {selected.kind === "tunnel" ? "CONNECT result" : "Status"}: {selected.status ?? "Waiting"} ·{" "}
                   {selected.responseBytes.toLocaleString()} bytes received
                 </p>
-                <Headers values={selected.responseHeaders} />
+                {selected.kind === "tunnel"
+                  ? <p>Inner response headers are not available.</p>
+                  : <Headers values={selected.responseHeaders} />}
               </>
             ) : (
               <dl>
