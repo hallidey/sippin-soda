@@ -1,0 +1,12 @@
+node_modules/
+dist/
+target/
+.tools/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.sippin-soda/secrets/
+.sippin-soda/sessions/
+
