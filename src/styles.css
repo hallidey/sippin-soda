@@ -640,7 +640,7 @@ input:focus-visible {
 .body-view {
   margin: 20px 0;
   padding: 16px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: 8px;
 }
 .body-options label,
@@ -650,6 +650,10 @@ input:focus-visible {
   align-items: center;
   flex-wrap: wrap;
   margin-bottom: 12px;
+}
+.body-options {
+  margin: 0 32px 20px;
+  background: var(--panel);
 }
 .body-options input[type="number"] {
   width: 100px;
