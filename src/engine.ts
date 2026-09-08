@@ -16,6 +16,7 @@ export type Capture = {
   requestHeaders: [string, string][];
   responseHeaders: [string, string][];
   error: string | null;
+  responseBodyError: string | null;
 };
 
 export type Snapshot = {

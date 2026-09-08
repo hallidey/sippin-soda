@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Capture, Snapshot } from "./engine";
+import { ResponseBody } from "./ResponseBody";
 
 function Headers({ values }: { values: Capture["requestHeaders"] }) {
   return values.length ? (
@@ -53,8 +54,8 @@ export function Traffic({
             : "This browser preview cannot start the proxy. Open the desktop app to capture real traffic."}
         </p>
         <p>
-          HTTP metadata + opaque CONNECT tunnels · Memory only · HTTPS content
-          stays encrypted; no CA is installed.
+          HTTP metadata + optional response body files · HTTPS content stays
+          encrypted; no CA is installed.
         </p>
       </div>
       <div className="traffic-toolbar">
@@ -166,9 +167,9 @@ export function Traffic({
             </h2>
             {selected.kind === "tunnel" && (
               <p className="capture-notice">
-                Opaque CONNECT tunnel. Status 200 means the tunnel opened;
-                the inner API status, headers and body are not inspected.
-                Byte counts include transport data such as TLS handshakes.
+                Opaque CONNECT tunnel. Status 200 means the tunnel opened; the
+                inner API status, headers and body are not inspected. Byte
+                counts include transport data such as TLS handshakes.
               </p>
             )}
             <div className="detail-tabs" aria-label="Inspector view">
@@ -193,18 +194,32 @@ export function Traffic({
                   {selected.requestBytes.toLocaleString()} bytes forwarded.
                   Query values and non-allowlisted header values are redacted.
                 </p>
-                {selected.kind === "tunnel" && <p>CONNECT negotiation headers only.</p>}
+                {selected.kind === "tunnel" && (
+                  <p>CONNECT negotiation headers only.</p>
+                )}
                 <Headers values={selected.requestHeaders} />
               </>
             ) : tab === "Response" ? (
               <>
                 <p>
-                  {selected.kind === "tunnel" ? "CONNECT result" : "Status"}: {selected.status ?? "Waiting"} ·{" "}
+                  {selected.kind === "tunnel" ? "CONNECT result" : "Status"}:{" "}
+                  {selected.status ?? "Waiting"} ·{" "}
                   {selected.responseBytes.toLocaleString()} bytes received
                 </p>
-                {selected.kind === "tunnel"
-                  ? <p>Inner response headers are not available.</p>
-                  : <Headers values={selected.responseHeaders} />}
+                {selected.kind === "tunnel" ? (
+                  <p>Inner response headers are not available.</p>
+                ) : (
+                  <>
+                    <Headers values={selected.responseHeaders} />
+                    <ResponseBody
+                      key={selected.id}
+                      id={selected.id}
+                      desktop={desktop}
+                      pending={selected.phase === "pending"}
+                      recordingError={selected.responseBodyError}
+                    />
+                  </>
+                )}
               </>
             ) : (
               <dl>
@@ -221,8 +236,8 @@ export function Traffic({
               </dl>
             )}
             <p>
-              Payloads are streamed without being recorded. Body inspection is a
-              later milestone.
+              Request bodies and encrypted tunnel contents are not recorded.
+              HTTP response recording must be enabled before Start.
             </p>
           </>
         ) : (

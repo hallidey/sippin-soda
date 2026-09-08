@@ -635,3 +635,33 @@ input:focus-visible {
 .capture-notice {
   margin: 0 32px 10px;
 }
+/* Body data is paged: the DOM never holds the entire response. */
+.body-options,
+.body-view {
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.body-options label,
+.body-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.body-options input[type="number"] {
+  width: 100px;
+}
+.body-toolbar input:not([type="checkbox"]) {
+  width: 150px;
+}
+.body-content {
+  max-height: 440px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.5 monospace;
+  user-select: text;
+}

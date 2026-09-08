@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use sippin_soda_engine::{ProxyConfig, ProxyEngine, Snapshot};
+use sippin_soda_engine::{BodyPage, ProxyConfig, ProxyEngine, Snapshot};
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 
@@ -13,13 +13,30 @@ fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
 async fn start_proxy(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
     port: u16,
+    capture_bodies: bool,
+    disk_budget_gib: u32,
 ) -> Result<Snapshot, String> {
+    if !(1..=1024).contains(&disk_budget_gib) {
+        return Err("Disk budget must be between 1 and 1024 GiB.".into());
+    }
     engine
         .start(ProxyConfig {
             port,
+            capture_response_bodies: capture_bodies,
+            body_disk_budget: u64::from(disk_budget_gib) * 1024 * 1024 * 1024,
             ..Default::default()
         })
         .await
+}
+
+#[tauri::command]
+async fn response_body_page(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    offset: u64,
+    length: usize,
+) -> Result<BodyPage, String> {
+    engine.response_body_page(id, offset, length).await
 }
 
 #[tauri::command]
@@ -55,7 +72,8 @@ fn main() {
             engine_snapshot,
             start_proxy,
             stop_proxy,
-            clear_traffic
+            clear_traffic,
+            response_body_page
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Sippin Soda desktop")
@@ -63,6 +81,7 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 let engine = app.state::<Arc<ProxyEngine>>();
                 tauri::async_runtime::block_on(engine.stop());
+                engine.clear();
             }
         });
 }

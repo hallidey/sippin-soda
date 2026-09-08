@@ -1,5 +1,8 @@
 use crate::{EnginePhase, EngineStatus};
+mod bodies;
 mod tunnel;
+pub use bodies::BodyPage;
+use bodies::{BodyStore, RecordedBody};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Body, Bytes, Frame, Incoming, SizeHint},
@@ -36,6 +39,8 @@ pub struct ProxyConfig {
     pub connection_limit: usize,
     pub request_timeout: Duration,
     pub tunnel_timeout: Duration,
+    pub capture_response_bodies: bool,
+    pub body_disk_budget: u64,
 }
 
 impl Default for ProxyConfig {
@@ -46,6 +51,8 @@ impl Default for ProxyConfig {
             connection_limit: 64,
             request_timeout: Duration::from_secs(30),
             tunnel_timeout: Duration::from_secs(300),
+            capture_response_bodies: false,
+            body_disk_budget: 10 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -66,6 +73,7 @@ pub struct Capture {
     pub request_headers: Vec<(String, String)>,
     pub response_headers: Vec<(String, String)>,
     pub error: Option<String>,
+    pub response_body_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +90,9 @@ struct State {
     status: EngineStatus,
     traffic: VecDeque<Capture>,
     limit: usize,
+    bodies: Arc<BodyStore>,
+    capture_bodies: bool,
+    body_budget: u64,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -107,6 +118,9 @@ impl Default for ProxyEngine {
                 status: EngineStatus::default(),
                 traffic: VecDeque::new(),
                 limit: 200,
+                bodies: Arc::new(BodyStore::default()),
+                capture_bodies: false,
+                body_budget: 0,
             })),
             running: tokio::sync::Mutex::new(None),
         }
@@ -114,6 +128,26 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub async fn response_body_page(
+        &self,
+        id: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<BodyPage, String> {
+        let bodies = {
+            let state = self.shared.lock().unwrap();
+            let capture = state
+                .traffic
+                .iter()
+                .find(|capture| capture.id == id)
+                .ok_or("Capture cleared or evicted.")?;
+            if let Some(error) = &capture.response_body_error {
+                return Err(error.clone());
+            }
+            state.bodies.clone()
+        };
+        bodies.page(id, offset, length).await
+    }
     pub fn snapshot(&self) -> Snapshot {
         let state = self.shared.lock().unwrap();
         Snapshot {
@@ -140,6 +174,7 @@ impl ProxyEngine {
             || config.request_timeout > Duration::from_secs(300)
             || config.tunnel_timeout.is_zero()
             || config.tunnel_timeout > Duration::from_secs(3600)
+            || config.body_disk_budget == 0
         {
             return Err("Invalid proxy resource limits.".into());
         }
@@ -150,8 +185,12 @@ impl ProxyEngine {
         {
             let mut state = self.shared.lock().unwrap();
             state.limit = config.capture_limit;
+            state.capture_bodies = config.capture_response_bodies;
+            state.body_budget = config.body_disk_budget;
             while state.traffic.len() > state.limit {
-                state.traffic.pop_front();
+                if let Some(capture) = state.traffic.pop_front() {
+                    state.bodies.remove(capture.id);
+                }
                 state.status.evicted_captures += 1;
             }
             state.status.captures = state.traffic.len();
@@ -188,7 +227,7 @@ impl ProxyEngine {
                             // so upgrades cannot escape the connection cap or Stop.
                             let mut builder = http1::Builder::new();
                             builder.keep_alive(false).max_buf_size(32 * 1024).timer(TokioTimer::new()).header_read_timeout(deadline);
-                            let _ = timeout(deadline + Duration::from_secs(1), builder.serve_connection(TokioIo::new(stream), service).with_upgrades()).await;
+                            let _ = builder.serve_connection(TokioIo::new(stream), service).with_upgrades().await;
                             if let Ok(tunnel) = tunnel_rx.try_recv() {
                                 tunnel.run(deadline, tunnel_deadline).await;
                             }
@@ -219,6 +258,7 @@ impl ProxyEngine {
     pub fn clear(&self) -> Snapshot {
         let mut state = self.shared.lock().unwrap();
         state.traffic.clear();
+        state.bodies.clear();
         state.status.captures = 0;
         state.status.evicted_captures = 0;
         state.revision += 1;
@@ -412,7 +452,9 @@ async fn handle(
         let id = state.next_id;
         state.next_id += 1;
         if state.traffic.len() == state.limit {
-            state.traffic.pop_front();
+            if let Some(capture) = state.traffic.pop_front() {
+                state.bodies.remove(capture.id);
+            }
             state.status.evicted_captures += 1;
         }
         state.traffic.push_back(Capture {
@@ -437,6 +479,7 @@ async fn handle(
             request_headers: safe_headers(request.headers()),
             response_headers: vec![],
             error: None,
+            response_body_error: None,
         });
         state.status.captures = state.traffic.len();
         state.revision += 1;
@@ -545,14 +588,70 @@ async fn forward(
         capture.response_headers = safe_headers(&parts.headers);
     });
     strip_hop_headers(&mut parts.headers);
+    let (bodies, enabled, budget) = {
+        let state = exchange.shared.lock().unwrap();
+        (
+            state.bodies.clone(),
+            state.capture_bodies,
+            state.body_budget,
+        )
+    };
+    let mut tap = if enabled {
+        let encoding = if body.is_end_stream() {
+            String::new()
+        } else {
+            parts
+                .headers
+                .get_all("content-encoding")
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap_or("unsupported")
+                        .trim()
+                        .to_ascii_lowercase()
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        match bodies.record(exchange.id, encoding, budget).await {
+            Ok(tap) => {
+                if !exchange
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .traffic
+                    .iter()
+                    .any(|capture| capture.id == exchange.id)
+                {
+                    bodies.remove(exchange.id);
+                }
+                Some(tap)
+            }
+            Err(error) => {
+                exchange.update(|capture| capture.response_body_error = Some(error));
+                None
+            }
+        }
+    } else {
+        None
+    };
     if body.is_end_stream() {
+        if let Some(tap) = tap.take() {
+            tap.finish_empty().await;
+        }
         exchange.finish(None);
     }
     let body = ResponseBody {
-        observed: ObservedBody {
-            inner: body,
-            exchange,
-            response: true,
+        observed: RecordedBody {
+            inner: ObservedBody {
+                inner: body,
+                exchange,
+                response: true,
+            },
+            tap,
+            pending: None,
+            written: 0,
         },
         _connection: guard,
     };
@@ -596,7 +695,7 @@ impl Drop for ConnectionGuard {
 }
 
 struct ResponseBody {
-    observed: ObservedBody,
+    observed: RecordedBody,
     _connection: ConnectionGuard,
 }
 impl Body for ResponseBody {
