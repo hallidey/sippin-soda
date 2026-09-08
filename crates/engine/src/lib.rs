@@ -1,14 +1,17 @@
-//! UI-independent engine contracts. No listener is started by this foundation.
+//! UI-independent network engine and development policies.
+mod proxy;
+pub use proxy::*;
 use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnginePhase {
-    NotImplemented,
+    Stopped,
+    Running,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
     pub phase: EnginePhase,
@@ -16,16 +19,20 @@ pub struct EngineStatus {
     pub captures: usize,
     pub https_inspection: bool,
     pub production_protection: bool,
+    pub evicted_captures: u64,
+    pub rejected_connections: u64,
 }
 
 impl Default for EngineStatus {
     fn default() -> Self {
         Self {
-            phase: EnginePhase::NotImplemented,
+            phase: EnginePhase::Stopped,
             listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             captures: 0,
             https_inspection: false,
             production_protection: true,
+            evicted_captures: 0,
+            rejected_connections: 0,
         }
     }
 }
@@ -134,7 +141,7 @@ mod tests {
     fn initial_status_never_claims_a_running_proxy() {
         let status = EngineStatus::default();
         assert!(status.listen_address.ip().is_loopback());
-        assert_eq!(status.phase, EnginePhase::NotImplemented);
+        assert_eq!(status.phase, EnginePhase::Stopped);
         assert!(!status.https_inspection);
         assert!(status.production_protection);
         assert_eq!(status.captures, 0);
