@@ -1,6 +1,7 @@
 node_modules/
 dist/
 target/
+src-tauri/gen/
 .tools/
 .env
 .env.*
@@ -9,4 +10,3 @@ target/
 .DS_Store
 .sippin-soda/secrets/
 .sippin-soda/sessions/
-

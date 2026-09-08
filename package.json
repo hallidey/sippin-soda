@@ -8,9 +8,10 @@
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc && vite build",
     "check": "tsc --noEmit",
-    "tauri": "tauri",
-    "desktop": "tauri dev",
-    "test:engine": "cargo test -p sippin-soda-engine"
+    "tauri": "node scripts/with-rust.mjs tauri",
+    "desktop": "node scripts/with-rust.mjs tauri dev",
+    "test:engine": "node scripts/with-rust.mjs cargo test -p sippin-soda-engine",
+    "fixture": "node examples/http-fixture.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

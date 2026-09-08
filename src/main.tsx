@@ -1,15 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { useEngine } from "./engine";
+import { Traffic } from "./Traffic";
 import "./styles.css";
 
-type EngineStatus = {
-  phase: "not_implemented";
-  listenAddress: string;
-  captures: number;
-  httpsInspection: boolean;
-  productionProtection: boolean;
-};
 const sections = [
   "Traffic",
   "Collections",
@@ -67,24 +61,17 @@ function App() {
   const [theme, setTheme] = useState(
     () => localStorage.getItem("sippin-theme") || "system",
   );
-  const [status, setStatus] = useState<EngineStatus | null>(null);
-  const [error, setError] = useState("");
-  const desktop = isTauri();
+  const { snapshot, error, busy, command, desktop } = useEngine();
+  const status = snapshot?.status;
+  const running = status?.phase === "running";
+  const [port, setPort] = useState("8080");
+  const validPort =
+    /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("sippin-theme", theme);
   }, [theme]);
-  useEffect(() => {
-    if (desktop)
-      invoke<EngineStatus>("engine_status")
-        .then(setStatus)
-        .catch(() =>
-          setError(
-            "Unable to read engine status. Restart the desktop application.",
-          ),
-        );
-  }, [desktop]);
 
   return (
     <div className="app-shell">
@@ -114,13 +101,15 @@ function App() {
                 {["↔", "▤", "◇", "≡", "◈", "◎", "▷", "⚙"][index]}
               </span>
               {item}
-              {item === "Traffic" && <span className="count">0</span>}
+              {item === "Traffic" && (
+                <span className="count">{status?.captures ?? 0}</span>
+              )}
             </button>
           ))}
         </nav>
         <div className="sidebar-footer">
           <span className="local-dot" /> Local-first. Yours by default.
-          <small>v0.1 · Foundation</small>
+          <small>v0.1 · HTTP preview</small>
         </div>
       </aside>
       <main>
@@ -133,7 +122,9 @@ function App() {
             <span className="status-dot" />
             {desktop
               ? status
-                ? "Proxy not started"
+                ? running
+                  ? "Capturing HTTP"
+                  : "Proxy stopped"
                 : "Connecting to engine…"
               : "UI preview"}
             <span className="environment">LOCAL</span>
@@ -146,13 +137,32 @@ function App() {
             <p>{descriptions[section]}</p>
           </div>
           {section === "Traffic" && (
-            <button
-              className="primary"
-              disabled
-              title="Capture will be available after the HTTP proxy milestone"
-            >
-              Start capture <span aria-hidden="true">↗</span>
-            </button>
+            <div className="proxy-controls">
+              <label>
+                Port
+                <input
+                  aria-label="Proxy port"
+                  inputMode="numeric"
+                  value={port}
+                  onChange={(event) => setPort(event.target.value)}
+                  disabled={running || busy}
+                />
+              </label>
+              <button
+                className="primary"
+                disabled={
+                  !desktop || !status || busy || (!running && !validPort)
+                }
+                onClick={() =>
+                  void command(
+                    running ? "stop_proxy" : "start_proxy",
+                    running ? undefined : { port: Number(port) },
+                  )
+                }
+              >
+                {busy ? "Please wait…" : running ? "Stop proxy" : "Start proxy"}
+              </button>
+            </div>
           )}
         </div>
         {error && (
@@ -161,58 +171,12 @@ function App() {
           </p>
         )}
         {section === "Traffic" ? (
-          <>
-            <div className="traffic-toolbar">
-              <span>
-                All traffic <span className="pill">0</span>
-              </span>
-              <span className="muted">
-                Capture will be available in the next milestone
-              </span>
-            </div>
-            <div
-              className="traffic-table"
-              role="table"
-              aria-label="Captured traffic"
-            >
-              <div className="table-head" role="row">
-                {["METHOD", "HOST / PATH", "STATUS", "DURATION", "SIZE"].map(
-                  (label) => (
-                    <span role="columnheader" key={label}>
-                      {label}
-                    </span>
-                  ),
-                )}
-              </div>
-              <div className="empty-state">
-                <div className="logo-tile">
-                  <Glass large />
-                </div>
-                <span className="eyebrow">A CLEAR VIEW STARTS HERE</span>
-                <h2>Let’s see what’s flowing.</h2>
-                <p>
-                  This workspace is ready for its first request.
-                  <br />
-                  The HTTP proxy is the next development milestone.
-                </p>
-                <div className="empty-note">
-                  <span className="status-dot" /> No proxy is listening. No
-                  traffic is being captured.
-                </div>
-              </div>
-            </div>
-            <div className="inspector">
-              <span className="inspector-title">REQUEST INSPECTOR</span>
-              <p>Select a captured request to explore its details.</p>
-              <div
-                className="inspector-tabs"
-                aria-label="Planned inspector views"
-              >
-                Request <span>Response</span> <span>Headers</span>{" "}
-                <span>Timing</span>
-              </div>
-            </div>
-          </>
+          <Traffic
+            snapshot={snapshot}
+            desktop={desktop}
+            busy={busy}
+            clear={() => void command("clear_traffic")}
+          />
         ) : section === "Settings" ? (
           <div className="settings-panel">
             <h2>Appearance</h2>
@@ -231,20 +195,20 @@ function App() {
             <h2>Engine</h2>
             <p>
               {desktop
-                ? "Desktop bridge connected to the local Rust engine contract."
+                ? "The local Rust engine handles HTTP forwarding and capture."
                 : "Browser preview. Run npm run desktop to use the native application."}
             </p>
             <dl>
               <dt>Proxy</dt>
-              <dd>Not implemented yet</dd>
-              <dt>Planned listen address</dt>
+              <dd>{running ? "Running" : "Stopped"}</dd>
+              <dt>Listen address</dt>
               <dd>{status?.listenAddress ?? "127.0.0.1:8080"}</dd>
               <dt>HTTPS inspection</dt>
               <dd>Not available · no CA installed</dd>
               <dt>Production policy</dt>
               <dd>
                 {status?.productionProtection
-                  ? "Read-only policy defined in engine"
+                  ? "Observation only; replay and modification unavailable"
                   : "Read-only by design"}
               </dd>
             </dl>
@@ -270,7 +234,8 @@ function App() {
           </span>
           <span>
             {desktop ? "Desktop" : "Development preview"}
-            <span className="slash">·</span> HTTP proxy planned
+            <span className="slash">·</span>{" "}
+            {running ? "HTTP proxy active" : "HTTP proxy stopped"}
           </span>
         </footer>
       </main>

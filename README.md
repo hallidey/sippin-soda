@@ -8,7 +8,9 @@ An open-source desktop project for Windows, macOS and Linux, designed to observe
 
 ## Current state
 
-Early foundation, **not a working proxy yet**. This first increment contains the Tauri + React + TypeScript desktop structure, a UI-independent Rust engine crate, initial safety/header-redaction policies, workspace navigation and theme preferences. All traffic screens start empty; capture is disabled until the real networking milestone. No CA is installed and no system proxy setting is changed.
+**HTTP development preview.** The Tauri desktop app starts/stops a real loopback HTTP proxy backed by an independent Rust engine. Traffic shows real request/response metadata, filtered headers, status, duration and byte counts. Capture history is bounded and kept in memory; bodies are streamed without being recorded. HTTPS/CONNECT, replay, modification and disk sessions are not implemented yet. No CA is installed and no system proxy setting is changed.
+
+Follow the [local HTTP walkthrough](docs/HTTP_PROXY.md) to send traffic through Sippin Soda to the included fixture server.
 
 ## Development
 
@@ -19,7 +21,9 @@ npm ci
 npm run desktop
 ```
 
-`npm run dev` previews the UI in a browser for development only; the product is a native desktop app. `npm run build` typechecks and builds the frontend. `cargo test -p sippin-soda-engine` checks the initial core policies. `npm run tauri -- build --no-bundle` compiles the desktop application; installer packaging/signing is a later milestone.
+The npm desktop/test commands also recognize an optional local Rust installation under `.tools/cargo` and `.tools/rustup`, without modifying the system PATH. Otherwise they use the normal installed Rust toolchain. Stop an existing `npm run dev` preview before starting `npm run desktop`, since both use port 1420.
+
+`npm run dev` previews the UI in a browser for development only; capture controls require the native app. `npm run build` typechecks and builds the frontend. `cargo test -p sippin-soda-engine` runs policy and real HTTP integration tests. `npm run tauri -- build --no-bundle` compiles the desktop application; installer packaging/signing is a later milestone.
 
 ## Structure
 

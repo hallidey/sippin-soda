@@ -11,3 +11,4 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 sippin-soda-engine = { path = "../crates/engine" }
+tokio = { version = "1", features = ["time"] }

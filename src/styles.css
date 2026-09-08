@@ -480,3 +480,158 @@ dd {
     }
   }
 }
+
+.proxy-controls {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+}
+.proxy-controls label,
+.search-label {
+  display: flex;
+  gap: 7px;
+  flex-direction: column;
+  font-size: 10px;
+  color: var(--muted);
+}
+input {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 8px 10px;
+}
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.proxy-controls input {
+  width: 80px;
+}
+.proxy-help {
+  margin: 0 32px 12px;
+  padding: 15px 18px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.proxy-help strong {
+  font-size: 12px;
+}
+.proxy-help p {
+  font-size: 11px;
+  margin-top: 4px;
+}
+.search-label {
+  flex: 1;
+  max-width: 380px;
+}
+.traffic-toolbar {
+  gap: 20px;
+  align-items: end;
+}
+.traffic-toolbar button {
+  font-size: 11px;
+}
+.live-traffic {
+  max-height: 340px;
+  overflow: auto;
+  min-height: 220px;
+}
+.live-traffic table {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+  font-size: 11px;
+}
+.live-traffic th {
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  text-align: left;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 12px;
+}
+.live-traffic th:first-child {
+  width: 56%;
+}
+.live-traffic td {
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.request-select {
+  display: flex;
+  align-items: start;
+  gap: 12px;
+  text-align: left;
+  padding: 3px 0;
+  border: 0;
+  background: none;
+  width: 100%;
+  font-size: 11px;
+}
+.request-select b {
+  color: var(--accent);
+  min-width: 45px;
+}
+.request-select span {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.active-row {
+  background: var(--selected);
+}
+.live-traffic .empty-state {
+  min-height: 230px;
+  padding: 25px 16px;
+}
+.setup-command {
+  display: block;
+  font-size: 10px;
+  margin: 16px 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.live-inspector {
+  min-height: 130px;
+}
+.live-inspector h2 {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+.detail-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 15px 0;
+}
+.detail-tabs button {
+  padding: 7px 12px;
+  font-size: 11px;
+}
+.detail-tabs button[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--selected);
+}
+.header-list {
+  display: block;
+  max-height: 200px;
+  overflow: auto;
+}
+.header-list div {
+  display: grid;
+  grid-template-columns: minmax(100px, 180px) minmax(0, 1fr);
+  gap: 15px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+.header-list dd {
+  font-family: Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.capture-notice {
+  margin: 0 32px 10px;
+}

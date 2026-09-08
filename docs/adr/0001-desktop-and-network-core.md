@@ -19,11 +19,11 @@ Sippin Soda needs an independent network engine, a local desktop UI, bounded res
 
 Use React + TypeScript in a Tauri 2 shell. Put engine contracts and policies in `crates/engine` with no UI dependency. Use Rust provisionally to avoid introducing an FFI boundary before there is evidence it is needed. Do not add a hosted API or cloud store.
 
-The current engine only exposes honest startup status and initial pure policy functions. It does not open a network listener, install a certificate or change system proxy settings. Session/body/query redaction and destination classification remain unimplemented.
+The HTTP spike now uses Tokio + Hyper in the independent engine crate. It has an explicit loopback listener, streaming forwarding, bounded metadata capture and cancellation. Local integration fixtures verify real transfers, failure paths and lifecycle. No CA or system proxy setting is changed. TLS, session persistence, full redaction and destination classification remain unimplemented.
 
 ## Required validation before accepting the network decision
 
-1. Implement an explicit HTTP proxy spike with local upstream fixtures and streaming cancellation.
+1. HTTP spike implemented: local upstream fixtures, streaming byte forwarding and cancellation. Desktop Start/Stop, native IPC events and real 200/500/slow captures verified on Windows. This is functional evidence, not a performance benchmark.
 2. Test CONNECT pass-through separately from TLS interception; validate upstream trust and failure behavior.
 3. Record hardware, concurrency, payload size, throughput, p50/p95 overhead and peak memory.
 4. Evaluate Hyper/Rustls limitations against the protocol roadmap and compare a C++ alternative where gaps matter.
