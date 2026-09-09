@@ -1,7 +1,7 @@
 use crate::{EnginePhase, EngineStatus};
 mod bodies;
 mod tunnel;
-pub use bodies::BodyPage;
+pub use bodies::{BodyPage, JsonStatus, SearchStep};
 use bodies::{BodyStore, RecordedBody};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
@@ -128,6 +128,34 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub async fn search_response_body(
+        &self,
+        id: u64,
+        needle: String,
+        start: u64,
+        end: u64,
+    ) -> Result<SearchStep, String> {
+        let bodies = self.shared.lock().unwrap().bodies.clone();
+        bodies.search(id, needle, start, end).await
+    }
+    pub fn response_json_view(
+        &self,
+        id: u64,
+        start: bool,
+        cancel: bool,
+    ) -> Result<JsonStatus, String> {
+        let bodies = self.shared.lock().unwrap().bodies.clone();
+        bodies.json_view(id, start, cancel)
+    }
+    pub async fn response_json_page(
+        &self,
+        id: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<BodyPage, String> {
+        let bodies = self.shared.lock().unwrap().bodies.clone();
+        bodies.json_page(id, offset, length).await
+    }
     pub async fn response_body_page(
         &self,
         id: u64,

@@ -1,4 +1,6 @@
 use super::*;
+mod inspect;
+pub use inspect::{JsonStatus, SearchStep};
 use std::future::Future;
 use std::{
     collections::HashMap,
@@ -21,6 +23,8 @@ pub struct BodyPage {
 }
 
 struct Entry {
+    json: Mutex<inspect::JsonView>,
+    limit: u64,
     file: Mutex<Option<tempfile::NamedTempFile>>,
     worker: Mutex<Option<tokio::task::AbortHandle>>,
     budget: Arc<AtomicU64>,
@@ -38,6 +42,7 @@ impl Entry {
             worker.abort();
         }
         self.file.lock().unwrap().take();
+        self.json.lock().unwrap().file.take();
         self.budget
             .fetch_sub(self.reserved.swap(0, Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -55,10 +60,19 @@ impl Drop for Entry {
     }
 }
 
-#[derive(Default)]
 pub(super) struct BodyStore {
     entries: Mutex<HashMap<u64, Arc<Entry>>>,
     used: Arc<AtomicU64>,
+    analysis: Arc<tokio::sync::Semaphore>,
+}
+impl Default for BodyStore {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            used: Arc::new(AtomicU64::new(0)),
+            analysis: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
 }
 impl BodyStore {
     pub fn remove(&self, id: u64) {
@@ -126,6 +140,8 @@ impl BodyStore {
         .map_err(|_| "Cannot create body storage.")?;
         let writer = file.reopen().map_err(|_| "Cannot open body writer.")?;
         let entry = Arc::new(Entry {
+            json: Mutex::new(inspect::JsonView::default()),
+            limit,
             file: Mutex::new(Some(file)),
             worker: Mutex::new(None),
             budget: self.used.clone(),
