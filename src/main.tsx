@@ -195,7 +195,7 @@ function App() {
                   disabled={running || busy || !desktop}
                   onChange={(event) => setCaptureBodies(event.target.checked)}
                 />{" "}
-                Record HTTP response bodies
+                Record HTTP bodies
               </label>
               <label>
                 Session disk budget (GiB){" "}
@@ -209,10 +209,11 @@ function App() {
                 />
               </label>
               <p>
-                No per-response size cap. Bodies are stored in temporary local
-                files and read in 64 KiB pages. Raw body content is not redacted
-                or encrypted at rest and may contain secrets. Clear, eviction
-                and normal app exit remove files; Stop keeps them available.
+                Responses have no per-body size cap and remain unredacted.
+                JSON requests up to 1 MiB are redacted before temporary-disk
+                storage; other request formats are not recorded. Body files are
+                read in 64 KiB pages and are not encrypted at rest. Clear,
+                eviction and normal app exit remove them; Stop keeps them available.
               </p>
             </div>
             <Traffic

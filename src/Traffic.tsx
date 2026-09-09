@@ -54,8 +54,8 @@ export function Traffic({
             : "This browser preview cannot start the proxy. Open the desktop app to capture real traffic."}
         </p>
         <p>
-          HTTP metadata + optional response body files · HTTPS content stays
-          encrypted; no CA is installed.
+          HTTP metadata + optional body inspection · JSON requests are redacted
+          before storage · HTTPS content stays encrypted; no CA is installed.
         </p>
       </div>
       <div className="traffic-toolbar">
@@ -198,6 +198,22 @@ export function Traffic({
                   <p>CONNECT negotiation headers only.</p>
                 )}
                 <Headers values={selected.requestHeaders} />
+                {selected.requestBodyState === "disabled" ? (
+                  selected.requestBytes > 0 && (
+                    <p>Request body recording was disabled when the proxy started.</p>
+                  )
+                ) : selected.requestBodyState === "empty" ? (
+                  <p>No request body.</p>
+                ) : (
+                  <ResponseBody
+                    key={`request-${selected.id}`}
+                    id={selected.id}
+                    desktop={desktop}
+                    pending={selected.requestBodyState === "recording"}
+                    recordingError={selected.requestBodyError}
+                    direction="request"
+                  />
+                )}
               </>
             ) : tab === "Response" ? (
               <>
@@ -236,8 +252,9 @@ export function Traffic({
               </dl>
             )}
             <p>
-              Request bodies and encrypted tunnel contents are not recorded.
-              HTTP response recording must be enabled before Start.
+              Encrypted tunnel contents are not recorded. HTTP body recording
+              must be enabled before Start; request inspection currently
+              accepts JSON up to 1 MiB and stores only its redacted copy.
             </p>
           </>
         ) : (

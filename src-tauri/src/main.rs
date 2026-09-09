@@ -22,7 +22,7 @@ async fn start_proxy(
     engine
         .start(ProxyConfig {
             port,
-            capture_response_bodies: capture_bodies,
+            capture_bodies,
             body_disk_budget: u64::from(disk_budget_gib) * 1024 * 1024 * 1024,
             ..Default::default()
         })
@@ -37,6 +37,47 @@ async fn response_body_page(
     length: usize,
 ) -> Result<BodyPage, String> {
     engine.response_body_page(id, offset, length).await
+}
+
+#[tauri::command]
+async fn request_body_page(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    offset: u64,
+    length: usize,
+) -> Result<BodyPage, String> {
+    engine.request_body_page(id, offset, length).await
+}
+
+#[tauri::command]
+async fn search_request_body(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    needle: String,
+    start: u64,
+    end: u64,
+) -> Result<SearchStep, String> {
+    engine.search_request_body(id, needle, start, end).await
+}
+
+#[tauri::command]
+async fn request_json_view(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    start: bool,
+    cancel: bool,
+) -> Result<JsonStatus, String> {
+    engine.request_json_view(id, start, cancel)
+}
+
+#[tauri::command]
+async fn request_json_page(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    offset: u64,
+    length: usize,
+) -> Result<BodyPage, String> {
+    engine.request_json_page(id, offset, length).await
 }
 
 #[tauri::command]
@@ -104,6 +145,10 @@ fn main() {
             start_proxy,
             stop_proxy,
             clear_traffic,
+            request_body_page,
+            search_request_body,
+            request_json_view,
+            request_json_page,
             response_body_page,
             search_response_body,
             response_json_view,

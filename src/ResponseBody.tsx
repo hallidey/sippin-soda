@@ -23,12 +23,16 @@ export function ResponseBody({
   desktop,
   recordingError,
   pending,
+  direction = "response",
 }: {
   id: number;
   desktop: boolean;
   recordingError: string | null;
   pending: boolean;
+  direction?: "request" | "response";
 }) {
+  const command = (suffix: string) => `${direction}_${suffix}`;
+  const title = direction === "request" ? "Request body" : "Response body";
   const [offset, setOffset] = useState(0);
   const [jump, setJump] = useState("0");
   const [page, setPage] = useState<Page | null>(null);
@@ -56,7 +60,7 @@ export function ResponseBody({
     if (jsonStatus.state !== "building") return;
     let active = true;
     const timer = setInterval(() => {
-      void invoke<JsonStatus>("response_json_view", {
+      void invoke<JsonStatus>(command("json_view"), {
         id,
         start: false,
         cancel: false,
@@ -82,7 +86,7 @@ export function ResponseBody({
   }, [id, jsonStatus.state]);
   const prepareJson = async () => {
     try {
-      const status = await invoke<JsonStatus>("response_json_view", {
+      const status = await invoke<JsonStatus>(command("json_view"), {
         id,
         start: true,
         cancel: false,
@@ -110,14 +114,14 @@ export function ResponseBody({
     setSearchMessage("Searching recorded bytes…");
     try {
       // Freeze the range at click time. New streamed bytes require a new search.
-      const raw = await invoke<Page>("response_body_page", {
+      const raw = await invoke<Page>(command("body_page"), {
         id,
         offset: 0,
         length: 1,
       });
       let cursor = start;
       while (run === searchRun.current && mounted.current) {
-        const result = await invoke<SearchStep>("search_response_body", {
+        const result = await invoke<SearchStep>(`search_${direction}_body`, {
           id,
           needle,
           start: cursor,
@@ -161,7 +165,7 @@ export function ResponseBody({
     const read = async () => {
       try {
         const next = await invoke<Page>(
-          json ? "response_json_page" : "response_body_page",
+          json ? command("json_page") : command("body_page"),
           {
             id,
             offset,
@@ -185,7 +189,7 @@ export function ResponseBody({
       alive = false;
       clearTimeout(timer);
     };
-  }, [id, offset, desktop, recordingError, pending, json]);
+  }, [id, offset, desktop, recordingError, pending, json, direction]);
   const go = (next: number) => {
     setOffset(next);
     setJump(String(next));
@@ -201,12 +205,12 @@ export function ResponseBody({
         }).join("\n")
       : "";
   return (
-    <section className="body-view" aria-label="Response body">
-      <h3>Response body</h3>
+    <section className="body-view" aria-label={title}>
+      <h3>{title}</h3>
       <p>
-        Unredacted local capture · text is interpreted as UTF-8. Hex preserves
-        every byte; UTF-8 characters split at page boundaries may display as
-        replacement characters.
+        {direction === "request"
+          ? "Redacted JSON inspection copy · original request bytes were forwarded unchanged."
+          : "Unredacted local capture · text is interpreted as UTF-8. Hex preserves every byte; UTF-8 characters split at page boundaries may display as replacement characters."}
       </p>
       <div className="body-toolbar">
         <label>
@@ -272,7 +276,7 @@ export function ResponseBody({
             <span>Preparing paged JSON on disk…</span>
             <button
               onClick={() =>
-                void invoke("response_json_view", {
+                void invoke(command("json_view"), {
                   id,
                   start: false,
                   cancel: true,

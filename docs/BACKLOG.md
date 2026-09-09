@@ -5,7 +5,7 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | Requirement | Target | Current state | Exit evidence |
 | --- | --- | --- | --- |
 | Desktop foundation | v0.1 | Tauri/React scaffold, theme settings, honest empty states | UI build; CI native compilation |
-| F01 Observe | v0.1 | HTTP proxy, CONNECT, bounded metadata and opt-in disk-backed response inspection; request body/TLS inspection pending | Real HTTP/TCP/TLS fixtures plus 128 MiB response/tail and compressed body tests |
+| F01 Observe | v0.1 | HTTP proxy, CONNECT, bounded metadata, disk-backed response inspection and redacted JSON request inspection; TLS inspection pending | Real HTTP/TCP/TLS fixtures plus request-redaction, 128 MiB response/tail and compressed body tests |
 | F02 Intercept/modify | v0.1 | Planned | Pause response, change 200 to 500, continue |
 | F03 Replay | v0.1 / v0.3 sessions | Planned | Replay targets local fixture; cancellation and ordering |
 | F04 Rules | v0.1 / v0.3 advanced | Planned | Delay/status rule survives restart |
@@ -24,4 +24,4 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 
 ## Next implementation PR
 
-Paged response storage now includes full-body literal search and disk-backed JSON layout. Next, add structured body redaction and request body inspection, then explicit export. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
+JSON request bodies up to 1 MiB now have recursive built-in sensitive-key redaction before disk-backed inspection, while original bytes continue upstream unchanged. Next, make redaction paths configurable and add explicit export with a safety preview. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.

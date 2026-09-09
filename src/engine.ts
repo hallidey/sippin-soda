@@ -16,6 +16,8 @@ export type Capture = {
   requestHeaders: [string, string][];
   responseHeaders: [string, string][];
   error: string | null;
+  requestBodyState: "disabled" | "empty" | "recording" | "complete" | "unavailable";
+  requestBodyError: string | null;
   responseBodyError: string | null;
 };
 

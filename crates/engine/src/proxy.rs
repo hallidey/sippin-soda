@@ -39,7 +39,7 @@ pub struct ProxyConfig {
     pub connection_limit: usize,
     pub request_timeout: Duration,
     pub tunnel_timeout: Duration,
-    pub capture_response_bodies: bool,
+    pub capture_bodies: bool,
     pub body_disk_budget: u64,
 }
 
@@ -51,7 +51,7 @@ impl Default for ProxyConfig {
             connection_limit: 64,
             request_timeout: Duration::from_secs(30),
             tunnel_timeout: Duration::from_secs(300),
-            capture_response_bodies: false,
+            capture_bodies: false,
             body_disk_budget: 10 * 1024 * 1024 * 1024,
         }
     }
@@ -73,6 +73,8 @@ pub struct Capture {
     pub request_headers: Vec<(String, String)>,
     pub response_headers: Vec<(String, String)>,
     pub error: Option<String>,
+    pub request_body_state: String,
+    pub request_body_error: Option<String>,
     pub response_body_error: Option<String>,
 }
 
@@ -90,7 +92,8 @@ struct State {
     status: EngineStatus,
     traffic: VecDeque<Capture>,
     limit: usize,
-    bodies: Arc<BodyStore>,
+    request_bodies: Arc<BodyStore>,
+    response_bodies: Arc<BodyStore>,
     capture_bodies: bool,
     body_budget: u64,
 }
@@ -111,6 +114,7 @@ pub struct ProxyEngine {
 
 impl Default for ProxyEngine {
     fn default() -> Self {
+        let (request_bodies, response_bodies) = BodyStore::shared_pair();
         Self {
             shared: Arc::new(Mutex::new(State {
                 revision: 0,
@@ -118,7 +122,8 @@ impl Default for ProxyEngine {
                 status: EngineStatus::default(),
                 traffic: VecDeque::new(),
                 limit: 200,
-                bodies: Arc::new(BodyStore::default()),
+                request_bodies,
+                response_bodies,
                 capture_bodies: false,
                 body_budget: 0,
             })),
@@ -128,6 +133,54 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub async fn search_request_body(
+        &self,
+        id: u64,
+        needle: String,
+        start: u64,
+        end: u64,
+    ) -> Result<SearchStep, String> {
+        let bodies = self.shared.lock().unwrap().request_bodies.clone();
+        bodies.search(id, needle, start, end).await
+    }
+    pub fn request_json_view(
+        &self,
+        id: u64,
+        start: bool,
+        cancel: bool,
+    ) -> Result<JsonStatus, String> {
+        let bodies = self.shared.lock().unwrap().request_bodies.clone();
+        bodies.json_view(id, start, cancel)
+    }
+    pub async fn request_json_page(
+        &self,
+        id: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<BodyPage, String> {
+        let bodies = self.shared.lock().unwrap().request_bodies.clone();
+        bodies.json_page(id, offset, length).await
+    }
+    pub async fn request_body_page(
+        &self,
+        id: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<BodyPage, String> {
+        let bodies = {
+            let state = self.shared.lock().unwrap();
+            let capture = state
+                .traffic
+                .iter()
+                .find(|capture| capture.id == id)
+                .ok_or("Capture cleared or evicted.")?;
+            if let Some(error) = &capture.request_body_error {
+                return Err(error.clone());
+            }
+            state.request_bodies.clone()
+        };
+        bodies.page(id, offset, length).await
+    }
     pub async fn search_response_body(
         &self,
         id: u64,
@@ -135,7 +188,7 @@ impl ProxyEngine {
         start: u64,
         end: u64,
     ) -> Result<SearchStep, String> {
-        let bodies = self.shared.lock().unwrap().bodies.clone();
+        let bodies = self.shared.lock().unwrap().response_bodies.clone();
         bodies.search(id, needle, start, end).await
     }
     pub fn response_json_view(
@@ -144,7 +197,7 @@ impl ProxyEngine {
         start: bool,
         cancel: bool,
     ) -> Result<JsonStatus, String> {
-        let bodies = self.shared.lock().unwrap().bodies.clone();
+        let bodies = self.shared.lock().unwrap().response_bodies.clone();
         bodies.json_view(id, start, cancel)
     }
     pub async fn response_json_page(
@@ -153,7 +206,7 @@ impl ProxyEngine {
         offset: u64,
         length: usize,
     ) -> Result<BodyPage, String> {
-        let bodies = self.shared.lock().unwrap().bodies.clone();
+        let bodies = self.shared.lock().unwrap().response_bodies.clone();
         bodies.json_page(id, offset, length).await
     }
     pub async fn response_body_page(
@@ -172,7 +225,7 @@ impl ProxyEngine {
             if let Some(error) = &capture.response_body_error {
                 return Err(error.clone());
             }
-            state.bodies.clone()
+            state.response_bodies.clone()
         };
         bodies.page(id, offset, length).await
     }
@@ -213,11 +266,12 @@ impl ProxyEngine {
         {
             let mut state = self.shared.lock().unwrap();
             state.limit = config.capture_limit;
-            state.capture_bodies = config.capture_response_bodies;
+            state.capture_bodies = config.capture_bodies;
             state.body_budget = config.body_disk_budget;
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
-                    state.bodies.remove(capture.id);
+                    state.request_bodies.remove(capture.id);
+                    state.response_bodies.remove(capture.id);
                 }
                 state.status.evicted_captures += 1;
             }
@@ -286,7 +340,8 @@ impl ProxyEngine {
     pub fn clear(&self) -> Snapshot {
         let mut state = self.shared.lock().unwrap();
         state.traffic.clear();
-        state.bodies.clear();
+        state.request_bodies.clear();
+        state.response_bodies.clear();
         state.status.captures = 0;
         state.status.evicted_captures = 0;
         state.revision += 1;
@@ -417,6 +472,107 @@ struct ObservedBody {
     response: bool,
 }
 
+/// Captures only bounded JSON request bodies in memory. The original frames
+/// are forwarded unchanged; redaction happens before the safe copy reaches
+/// temporary storage.
+struct RequestBody {
+    observed: ObservedBody,
+    capture: Option<Vec<u8>>,
+    content_type: String,
+    limit: usize,
+}
+
+impl RequestBody {
+    fn finish_capture(&mut self) {
+        let Some(bytes) = self.capture.take() else {
+            return;
+        };
+        if bytes.is_empty() {
+            return;
+        }
+        let (store, budget) = {
+            let state = self.observed.exchange.shared.lock().unwrap();
+            (state.request_bodies.clone(), state.body_budget)
+        };
+        let exchange = self.observed.exchange.clone();
+        let content_type = self.content_type.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store
+                .store_redacted_json(exchange.id, bytes, content_type, budget)
+                .await
+            {
+                exchange.update(|capture| {
+                    capture.request_body_state = "unavailable".into();
+                    capture.request_body_error = Some(error);
+                });
+            } else {
+                exchange.update(|capture| capture.request_body_state = "complete".into());
+            }
+            exchange.shared.lock().unwrap().revision += 1;
+            if !exchange
+                .shared
+                .lock()
+                .unwrap()
+                .traffic
+                .iter()
+                .any(|capture| capture.id == exchange.id)
+            {
+                store.remove(exchange.id);
+            }
+        });
+    }
+}
+
+impl Body for RequestBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let result = Pin::new(&mut self.observed).poll_frame(cx);
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                let limit = self.limit;
+                if let (Some(buffer), Some(bytes)) = (&mut self.capture, frame.data_ref()) {
+                    if buffer.len().saturating_add(bytes.len()) <= limit {
+                        buffer.extend_from_slice(bytes);
+                    } else {
+                        self.capture.take();
+                        self.observed.exchange.update(|capture| {
+                            capture.request_body_error = Some(
+                                "Request body exceeds the 1 MiB safe inspection limit; original bytes were forwarded but not recorded."
+                                    .into(),
+                            )
+                        });
+                    }
+                }
+                if self.observed.is_end_stream() {
+                    self.finish_capture();
+                }
+            }
+            Poll::Ready(None) => {
+                self.finish_capture();
+            }
+            Poll::Ready(Some(Err(_))) => {
+                self.capture.take();
+                self.observed.exchange.update(|capture| {
+                    capture.request_body_error =
+                        Some("Request body transfer failed before it could be inspected.".into())
+                });
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.observed.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.observed.size_hint()
+    }
+}
+
 impl Body for ObservedBody {
     type Data = Bytes;
     type Error = hyper::Error;
@@ -481,7 +637,8 @@ async fn handle(
         state.next_id += 1;
         if state.traffic.len() == state.limit {
             if let Some(capture) = state.traffic.pop_front() {
-                state.bodies.remove(capture.id);
+                state.request_bodies.remove(capture.id);
+                state.response_bodies.remove(capture.id);
             }
             state.status.evicted_captures += 1;
         }
@@ -507,6 +664,8 @@ async fn handle(
             request_headers: safe_headers(request.headers()),
             response_headers: vec![],
             error: None,
+            request_body_state: "disabled".into(),
+            request_body_error: None,
             response_body_error: None,
         });
         state.status.captures = state.traffic.len();
@@ -593,13 +752,43 @@ async fn forward(
         HeaderValue::from_str(authority.as_str())
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid target host."))?,
     );
+    let capture_request = exchange.shared.lock().unwrap().capture_bodies;
+    let request_has_body = !request.body().is_end_stream();
+    let request_content_type = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let request_is_json = request_content_type
+        .split(';')
+        .next()
+        .is_some_and(|kind| kind.trim() == "application/json" || kind.trim().ends_with("+json"));
+    if capture_request && request_has_body && !request_is_json {
+        exchange.update(|capture| {
+            capture.request_body_state = "unavailable".into();
+            capture.request_body_error = Some(
+                "Request body was forwarded but not recorded: safe inspection currently supports JSON content types only."
+                    .into(),
+            )
+        });
+    } else if capture_request && request_has_body {
+        exchange.update(|capture| capture.request_body_state = "recording".into());
+    } else if capture_request {
+        exchange.update(|capture| capture.request_body_state = "empty".into());
+    }
     let (parts, body) = request.into_parts();
     let request = Request::from_parts(
         parts,
-        ObservedBody {
-            inner: body,
-            exchange: exchange.clone(),
-            response: false,
+        RequestBody {
+            observed: ObservedBody {
+                inner: body,
+                exchange: exchange.clone(),
+                response: false,
+            },
+            capture: (capture_request && request_has_body && request_is_json).then(Vec::new),
+            content_type: request_content_type,
+            limit: 1024 * 1024,
         },
     );
     let connection = tokio::spawn(async move {
@@ -619,7 +808,7 @@ async fn forward(
     let (bodies, enabled, budget) = {
         let state = exchange.shared.lock().unwrap();
         (
-            state.bodies.clone(),
+            state.response_bodies.clone(),
             state.capture_bodies,
             state.body_budget,
         )
