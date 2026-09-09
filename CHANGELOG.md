@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add full-body literal UTF-8 search with progress, cancellation, overlapping matches and navigation to the matching raw offset.
+- Add validated, paged JSON layout on disk, preserving number precision, duplicate keys and escapes; preparation is cancellable and shares the body storage budget.
 - Add opt-in HTTP response recording to temporary disk files, with 64 KiB text/hex pages, direct byte offsets and streaming gzip/deflate/Brotli decoding.
 - Support full large responses without a per-response capture cap or the former fixed HTTP transfer lifetime; retain a configurable session disk budget and mark incomplete recordings explicitly without truncating forwarding.
 - Verify 128 MiB capture and tail reads, live inspection, partial storage, cancellation, clear and compressed/empty bodies. Add 1800 KiB local JSON fixtures.

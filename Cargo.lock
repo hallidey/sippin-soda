@@ -3102,6 +3102,7 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-rustls",

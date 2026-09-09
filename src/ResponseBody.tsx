@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 type Page = {
@@ -10,6 +10,13 @@ type Page = {
   encoding: string;
 };
 const PAGE = 65536;
+type SearchStep = {
+  found: number | null;
+  nextOffset: number;
+  scannedTo: number;
+  done: boolean;
+};
+type JsonStatus = { state: string; error: string | null };
 
 export function ResponseBody({
   id,
@@ -27,6 +34,124 @@ export function ResponseBody({
   const [page, setPage] = useState<Page | null>(null);
   const [error, setError] = useState("");
   const [hex, setHex] = useState(false);
+  const [json, setJson] = useState(false);
+  const [jsonStatus, setJsonStatus] = useState<JsonStatus>({
+    state: "idle",
+    error: null,
+  });
+  const [needle, setNeedle] = useState("");
+  const [found, setFound] = useState<number | null>(null);
+  const [searchMessage, setSearchMessage] = useState("");
+  const [searching, setSearching] = useState(false);
+  const searchRun = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      searchRun.current += 1;
+    };
+  }, []);
+  useEffect(() => {
+    if (jsonStatus.state !== "building") return;
+    let active = true;
+    const timer = setInterval(() => {
+      void invoke<JsonStatus>("response_json_view", {
+        id,
+        start: false,
+        cancel: false,
+      })
+        .then((status) => {
+          if (!active) return;
+          setJsonStatus(status);
+          if (status.state === "ready") {
+            setJson(true);
+            setHex(false);
+            setOffset(0);
+            setJump("0");
+          }
+        })
+        .catch((cause) => {
+          if (active) setJsonStatus({ state: "error", error: String(cause) });
+        });
+    }, 750);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [id, jsonStatus.state]);
+  const prepareJson = async () => {
+    try {
+      const status = await invoke<JsonStatus>("response_json_view", {
+        id,
+        start: true,
+        cancel: false,
+      });
+      if (!mounted.current) return;
+      setJsonStatus(status);
+      if (status.state === "ready") {
+        setJson(true);
+        setHex(false);
+        go(0);
+      }
+    } catch (cause) {
+      if (mounted.current)
+        setJsonStatus({ state: "error", error: String(cause) });
+    }
+  };
+  const cancelSearch = () => {
+    searchRun.current += 1;
+    setSearching(false);
+    setSearchMessage("Search cancelled.");
+  };
+  const search = async (start: number) => {
+    const run = ++searchRun.current;
+    setSearching(true);
+    setSearchMessage("Searching recorded bytes…");
+    try {
+      // Freeze the range at click time. New streamed bytes require a new search.
+      const raw = await invoke<Page>("response_body_page", {
+        id,
+        offset: 0,
+        length: 1,
+      });
+      let cursor = start;
+      while (run === searchRun.current && mounted.current) {
+        const result = await invoke<SearchStep>("search_response_body", {
+          id,
+          needle,
+          start: cursor,
+          end: raw.total,
+        });
+        if (run !== searchRun.current || !mounted.current) return;
+        if (result.found !== null) {
+          setFound(result.found);
+          setJson(false);
+          setHex(false);
+          go(result.found);
+          setSearchMessage(
+            `Match at raw byte ${result.found.toLocaleString()}. Searched captured bytes; capture state: ${raw.state}.`,
+          );
+          break;
+        }
+        setSearchMessage(
+          `Searched ${result.scannedTo.toLocaleString()} / ${raw.total.toLocaleString()} bytes…`,
+        );
+        if (result.done) {
+          setSearchMessage(
+            `No ${start ? "further " : ""}match in ${raw.total.toLocaleString()} recorded bytes (${raw.state}).`,
+          );
+          break;
+        }
+        cursor = result.nextOffset;
+      }
+    } catch (cause) {
+      if (run === searchRun.current && mounted.current)
+        setSearchMessage(String(cause));
+    } finally {
+      if (run === searchRun.current && mounted.current) setSearching(false);
+    }
+  };
   useEffect(() => {
     if (!desktop || recordingError) return;
     let alive = true;
@@ -35,11 +160,14 @@ export function ResponseBody({
     setError("");
     const read = async () => {
       try {
-        const next = await invoke<Page>("response_body_page", {
-          id,
-          offset,
-          length: PAGE,
-        });
+        const next = await invoke<Page>(
+          json ? "response_json_page" : "response_body_page",
+          {
+            id,
+            offset,
+            length: PAGE,
+          },
+        );
         if (!alive) return;
         setPage(next);
         setError("");
@@ -57,7 +185,7 @@ export function ResponseBody({
       alive = false;
       clearTimeout(timer);
     };
-  }, [id, offset, desktop, recordingError, pending]);
+  }, [id, offset, desktop, recordingError, pending, json]);
   const go = (next: number) => {
     setOffset(next);
     setJump(String(next));
@@ -80,6 +208,92 @@ export function ResponseBody({
         every byte; UTF-8 characters split at page boundaries may display as
         replacement characters.
       </p>
+      <div className="body-toolbar">
+        <label>
+          Find in full body{" "}
+          <input
+            value={needle}
+            disabled={searching}
+            onChange={(event) => {
+              setNeedle(event.target.value);
+              setFound(null);
+              setSearchMessage("");
+            }}
+            placeholder="Exact text, case-sensitive"
+          />
+        </label>
+        <button
+          disabled={
+            !desktop ||
+            searching ||
+            !needle ||
+            new TextEncoder().encode(needle).length > 4096 ||
+            jsonStatus.state === "building"
+          }
+          onClick={() => void search(0)}
+        >
+          Find from start
+        </button>
+        <button
+          disabled={
+            searching || found === null || jsonStatus.state === "building"
+          }
+          onClick={() => void search((found ?? -1) + 1)}
+        >
+          Find next
+        </button>
+        {searching && <button onClick={cancelSearch}>Cancel search</button>}
+      </div>
+      {searchMessage && <p role="status">{searchMessage}</p>}
+      <div className="body-toolbar">
+        <button
+          aria-pressed={!json}
+          onClick={() => {
+            setJson(false);
+            go(0);
+          }}
+        >
+          Original bytes
+        </button>
+        <button
+          aria-pressed={json}
+          disabled={
+            !desktop ||
+            searching ||
+            jsonStatus.state === "building" ||
+            (!json && page?.state !== "complete")
+          }
+          onClick={() => void prepareJson()}
+        >
+          JSON layout
+        </button>
+        {jsonStatus.state === "building" && (
+          <>
+            <span>Preparing paged JSON on disk…</span>
+            <button
+              onClick={() =>
+                void invoke("response_json_view", {
+                  id,
+                  start: false,
+                  cancel: true,
+                }).catch((cause) =>
+                  setJsonStatus({ state: "error", error: String(cause) }),
+                )
+              }
+            >
+              Cancel layout
+            </button>
+          </>
+        )}
+      </div>
+      {jsonStatus.error && <p role="status">{jsonStatus.error}</p>}
+      {json && (
+        <p>
+          Formatted JSON · offsets refer to the formatted view. Search always
+          uses original decoded bytes. This temporary view shares the session
+          disk budget.
+        </p>
+      )}
       {recordingError || error ? (
         <p role="status">{recordingError || error}</p>
       ) : !page ? (
@@ -152,7 +366,19 @@ export function ResponseBody({
             Only this page is loaded into the interface.
           </p>
           <pre className="body-content" tabIndex={0}>
-            {hex ? hexText : text || "Empty body / waiting for bytes."}
+            {hex ? (
+              hexText
+            ) : !json &&
+              found === offset &&
+              text.startsWith(needle) &&
+              needle ? (
+              <>
+                <mark>{needle}</mark>
+                {text.slice(needle.length)}
+              </>
+            ) : (
+              text || "Empty body / waiting for bytes."
+            )}
           </pre>
         </>
       )}

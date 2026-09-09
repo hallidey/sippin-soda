@@ -24,4 +24,4 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 
 ## Next implementation PR
 
-Add structured body redaction and request body inspection on top of the implemented paged response storage. Extend body navigation with JSON formatting/search and explicit export. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
+Paged response storage now includes full-body literal search and disk-backed JSON layout. Next, add structured body redaction and request body inspection, then explicit export. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.

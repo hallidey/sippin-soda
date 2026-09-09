@@ -303,3 +303,145 @@ async fn empty_bodies_and_unsupported_or_corrupt_encodings_have_explicit_states(
         engine.stop().await;
     }
 }
+
+async fn record_payload(payload: Vec<u8>, budget: u64) -> ProxyEngine {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        drain_headers(&mut stream).await;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(&payload).await.unwrap();
+    });
+    let (engine, port) = start(budget).await;
+    let mut client = request(port, upstream).await;
+    tokio::io::copy(&mut client, &mut tokio::io::sink())
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(completed(&engine, 1).await.state, "complete");
+    engine.stop().await;
+    engine
+}
+
+async fn wait_json(engine: &ProxyEngine) -> sippin_soda_engine::JsonStatus {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let status = engine.response_json_view(1, false, false).unwrap();
+            if status.state != "building" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn json_layout_preserves_numbers_duplicate_keys_and_escapes() {
+    let original = br#"{"n":9007199254740993123456789,"n":1e9999,"s":"a\"b\\c\u0041","empty":[]}"#;
+    let engine = record_payload(original.to_vec(), 1024 * 1024).await;
+    engine.response_json_view(1, true, false).unwrap();
+    let status = wait_json(&engine).await;
+    assert_eq!(status.state, "ready", "{:?}", status.error);
+    let page = engine.response_json_page(1, 0, 65536).await.unwrap();
+    let rendered = String::from_utf8(page.bytes).unwrap();
+    assert!(rendered.contains("\n  \"n\": 9007199254740993123456789,"));
+    assert!(rendered.contains("\"n\": 1e9999"));
+    assert!(rendered.contains(r#""s": "a\"b\\c\u0041""#));
+    assert_eq!(
+        engine.response_body_page(1, 0, 65536).await.unwrap().bytes,
+        original
+    );
+    assert!(engine.response_json_page(1, 0, 65537).await.is_err());
+    engine.clear();
+    assert!(engine.response_json_page(1, 0, 1).await.is_err());
+}
+
+#[tokio::test]
+async fn large_json_layout_and_full_body_search_reach_the_tail() {
+    let mut original = b"{\"payload\":\"".to_vec();
+    original.extend(vec![b'x'; 5 * 1024 * 1024]);
+    original.extend_from_slice(b"\",\"tail\":\"END-OF-LARGE-RESPONSE\"}");
+    let length = original.len() as u64;
+    let engine = record_payload(original, 20 * 1024 * 1024).await;
+    let first = engine
+        .search_response_body(1, "END-OF-LARGE-RESPONSE".into(), 0, length)
+        .await
+        .unwrap();
+    assert!(!first.done);
+    let second = engine
+        .search_response_body(1, "END-OF-LARGE-RESPONSE".into(), first.next_offset, length)
+        .await
+        .unwrap();
+    let hit = second.found.unwrap();
+    assert_eq!(
+        engine.response_body_page(1, hit, 21).await.unwrap().bytes,
+        b"END-OF-LARGE-RESPONSE"
+    );
+    engine.response_json_view(1, true, false).unwrap();
+    let status = wait_json(&engine).await;
+    assert_eq!(status.state, "ready", "{:?}", status.error);
+    let total = engine.response_json_page(1, 0, 1).await.unwrap().total;
+    let tail = engine.response_json_page(1, total - 64, 64).await.unwrap();
+    assert!(String::from_utf8(tail.bytes)
+        .unwrap()
+        .contains("\"tail\": \"END-OF-LARGE-RESPONSE\""));
+}
+
+#[tokio::test]
+async fn invalid_json_and_expanded_layout_budget_do_not_damage_raw_capture() {
+    for original in [
+        b"{broken}".to_vec(),
+        b"{} {}".to_vec(),
+        vec![b'"', 0xff, b'"'],
+        format!("{}0{}", "[".repeat(129), "]".repeat(129)).into_bytes(),
+    ] {
+        let engine = record_payload(original.clone(), 1024 * 1024).await;
+        engine.response_json_view(1, true, false).unwrap();
+        assert_eq!(wait_json(&engine).await.state, "error");
+        assert_eq!(
+            engine.response_body_page(1, 0, 65536).await.unwrap().bytes,
+            original
+        );
+    }
+    let original = b"[1,2,3,4,5]";
+    let engine = record_payload(original.to_vec(), original.len() as u64 + 10).await;
+    engine.response_json_view(1, true, false).unwrap();
+    assert!(wait_json(&engine).await.error.unwrap().contains("budget"));
+    assert_eq!(
+        engine.response_body_page(1, 0, 65536).await.unwrap().bytes,
+        original
+    );
+    assert!(engine
+        .search_response_body(1, "".into(), 0, 1)
+        .await
+        .is_err());
+    assert!(engine
+        .search_response_body(1, "x".repeat(4097), 0, 1)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn json_layout_can_be_cancelled_and_retried() {
+    let mut payload = b"[\"".to_vec();
+    payload.extend(vec![b'x'; 8 * 1024 * 1024]);
+    payload.extend_from_slice(b"\"]");
+    let engine = record_payload(payload, 24 * 1024 * 1024).await;
+    engine.response_json_view(1, true, false).unwrap();
+    engine.response_json_view(1, false, true).unwrap();
+    assert_eq!(wait_json(&engine).await.state, "error");
+    engine.response_json_view(1, true, false).unwrap();
+    assert_eq!(wait_json(&engine).await.state, "ready");
+}
