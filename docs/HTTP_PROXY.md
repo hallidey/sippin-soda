@@ -17,20 +17,35 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 http://127.0.0.1:9090/slow
 
 On Windows PowerShell use `curl.exe` if `curl` is an alias. `--noproxy ""` prevents a client's localhost bypass from skipping the proxy. Select a request to view request/response headers, status, timing and byte counts. The fixture is a real HTTP server; the application does not manufacture traffic rows.
 
-**Stop proxy** stops accepting connections and cancels active transfers. Closing the desktop app stops the engine. **Clear** removes only the in-memory capture list and does not stop forwarding.
+**Stop proxy** stops accepting connections and cancels active transfers, retaining captures for inspection. Normal desktop exit stops the engine and clears captures. **Clear** removes metadata and temporary body files and cancels their recording, without stopping forwarding.
 
 ## Scope and bounds
 
 - HTTP forwarding uses absolute-form request URLs. HTTPS uses CONNECT with an authority-only `host:port` target and no request body. The upstream TCP connection is established before acknowledging CONNECT. Direct HTTP Upgrade requests return 501.
-- Upstream request and response bodies stream with Hyper backpressure. No payload bytes are retained, indexed or sent to the webview. Body inspection will be a separate increment.
+- Upstream request and response bodies stream with backpressure. Optional HTTP response recording uses a bounded 64 KiB pipe and disk writer, with an additional bounded decoder buffer. A slow disk may slow forwarding, but cannot cause an unbounded queue. The frontend only receives requested pages, never the whole body. Request payloads are not recorded.
 - Up to 200 captures; oldest captures are evicted with a visible count. Each side records up to 48 header entries, with names capped at 128 characters and values at 256. Target host/path are capped at 256/1024 characters. Header lists may therefore be incomplete.
 - Entire query strings and non-allowlisted header values are redacted in captures; originals still reach the upstream. URL paths remain visible and may contain sensitive data. This is not complete sensitive-data redaction.
 - At most 64 downstream connections, including upgraded CONNECT tunnels. Excess connections are closed and counted. Each accepted HTTP connection has one request; HTTP client keep-alive reuse is deliberately disabled for this spike. A CONNECT tunnel can carry multiple encrypted requests.
-- 30 seconds to receive upstream HTTP headers or establish the CONNECT destination; HTTP connection lifetime is bounded to approximately 31 seconds, including slow client headers and response streaming. CONNECT tunnels have a separate 300-second lifetime after upgrade (not an idle timeout). Long streams may be interrupted and marked as errors. Engine configuration allows a tunnel lifetime up to 3600 seconds; the desktop currently uses 300.
+- 30 seconds for client HTTP headers and for receiving upstream HTTP headers or establishing CONNECT. HTTP response streaming no longer has a fixed total lifetime: a large/slow response can complete beyond 31 seconds. Idle response connections also remain open until upstream/client close or Stop; they occupy the shared 64-connection budget. CONNECT tunnels retain their separate 300-second lifetime after upgrade (not an idle timeout), configurable in the engine up to 3600 seconds.
 - Upstream redirects are returned to the client, not followed by the engine. If the client follows them, those are separate requests.
 - Upstream failures yield 502; upstream-header timeout yields 504; self-routing detected after DNS resolution yields 508. No replay, mutation or fault injection is enabled.
 - Transport completion means the proxy consumed the upstream body; it cannot prove that the receiving application processed it.
-- Frontend updates use native IPC invalidation events capped at four per second, followed by bounded snapshots. Nothing is persisted to disk.
+- Metadata updates use native IPC invalidation events capped at four per second, followed by bounded snapshots. A selected recording body is read at most once per second until completion; page reads are separately bounded to 64 KiB. Only opt-in response bodies reach temporary disk files.
+
+## Large HTTP responses
+
+Before Start, enable **Record HTTP response bodies** and choose the session disk budget (10 GiB by default, configurable from 1 to 1024 GiB in the desktop). There is no fixed per-response size cap. A response around 1800 KB is fully supported; the integration suite additionally checks the end of a 128 MiB response. This is a functional large-file test, not a measured peak-memory benchmark.
+
+```sh
+curl --noproxy "" --proxy http://127.0.0.1:8080 http://127.0.0.1:9090/large --output large.json
+curl --noproxy "" --proxy http://127.0.0.1:8080 --compressed http://127.0.0.1:9090/large-gzip --output large-decoded.json
+```
+
+Both fixtures contain a 1800 KiB string plus JSON framing and an `END-OF-LARGE-RESPONSE` marker. Open **Response → Response body**, then **Last** to see the marker. Use Previous/Next or a byte offset to read any portion of the body. UTF-8 text is displayed without parsing the full JSON document; Hex preserves exact bytes. Characters split across a page boundary may show replacement characters in text view. JSON pretty printing, whole-body search and export are not part of this increment.
+
+Identity, gzip (including multiple members), zlib-wrapped deflate and Brotli are decoded progressively for inspection; forwarding preserves the original encoded bytes. Unsupported encoding stacks/codecs are reported as unavailable. The budget counts decoded bytes across retained recordings, so compressed expansion cannot bypass it. Disk exhaustion, quota exhaustion, corrupt compression, cancellation and interrupted transport are visible as partial/unavailable capture states. Such capture errors do not intentionally truncate the response sent to the client; Stop still cancels transport. No response is presented as fully captured after a known capture failure.
+
+Raw body contents are **not redacted or encrypted at rest**. Recording is off by default and is never enabled by merely launching the app. Clear, retention eviction and normal exit remove temporary files; a crash may leave files behind, and deletion is not secure erasure. This is temporary inspection storage, not session persistence or portable export. HTTPS bodies remain inaccessible inside opaque CONNECT tunnels.
 
 ## Validation
 

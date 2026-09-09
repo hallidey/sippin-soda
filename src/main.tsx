@@ -65,6 +65,12 @@ function App() {
   const status = snapshot?.status;
   const running = status?.phase === "running";
   const [port, setPort] = useState("8080");
+  const [captureBodies, setCaptureBodies] = useState(false);
+  const [diskBudget, setDiskBudget] = useState("10");
+  const validBudget =
+    /^\d+$/.test(diskBudget) &&
+    Number(diskBudget) >= 1 &&
+    Number(diskBudget) <= 1024;
   const validPort =
     /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
 
@@ -151,12 +157,21 @@ function App() {
               <button
                 className="primary"
                 disabled={
-                  !desktop || !status || busy || (!running && !validPort)
+                  !desktop ||
+                  !status ||
+                  busy ||
+                  (!running && (!validPort || !validBudget))
                 }
                 onClick={() =>
                   void command(
                     running ? "stop_proxy" : "start_proxy",
-                    running ? undefined : { port: Number(port) },
+                    running
+                      ? undefined
+                      : {
+                          port: Number(port),
+                          captureBodies,
+                          diskBudgetGib: Number(diskBudget),
+                        },
                   )
                 }
               >
@@ -171,12 +186,42 @@ function App() {
           </p>
         )}
         {section === "Traffic" ? (
-          <Traffic
-            snapshot={snapshot}
-            desktop={desktop}
-            busy={busy}
-            clear={() => void command("clear_traffic")}
-          />
+          <>
+            <div className="body-options">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={captureBodies}
+                  disabled={running || busy || !desktop}
+                  onChange={(event) => setCaptureBodies(event.target.checked)}
+                />{" "}
+                Record HTTP response bodies
+              </label>
+              <label>
+                Session disk budget (GiB){" "}
+                <input
+                  type="number"
+                  min="1"
+                  max="1024"
+                  value={diskBudget}
+                  disabled={running || busy || !desktop}
+                  onChange={(event) => setDiskBudget(event.target.value)}
+                />
+              </label>
+              <p>
+                No per-response size cap. Bodies are stored in temporary local
+                files and read in 64 KiB pages. Raw body content is not redacted
+                or encrypted at rest and may contain secrets. Clear, eviction
+                and normal app exit remove files; Stop keeps them available.
+              </p>
+            </div>
+            <Traffic
+              snapshot={snapshot}
+              desktop={desktop}
+              busy={busy}
+              clear={() => void command("clear_traffic")}
+            />
+          </>
         ) : section === "Settings" ? (
           <div className="settings-panel">
             <h2>Appearance</h2>

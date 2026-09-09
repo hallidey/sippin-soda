@@ -5,7 +5,7 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | Requirement | Target | Current state | Exit evidence |
 | --- | --- | --- | --- |
 | Desktop foundation | v0.1 | Tauri/React scaffold, theme settings, honest empty states | UI build; CI native compilation |
-| F01 Observe | v0.1 | HTTP proxy, opaque CONNECT tunnels, bounded metadata and native capture events implemented; body/TLS inspection pending | Real local HTTP/TCP/TLS fixtures; native desktop build |
+| F01 Observe | v0.1 | HTTP proxy, CONNECT, bounded metadata and opt-in disk-backed response inspection; request body/TLS inspection pending | Real HTTP/TCP/TLS fixtures plus 128 MiB response/tail and compressed body tests |
 | F02 Intercept/modify | v0.1 | Planned | Pause response, change 200 to 500, continue |
 | F03 Replay | v0.1 / v0.3 sessions | Planned | Replay targets local fixture; cancellation and ordering |
 | F04 Rules | v0.1 / v0.3 advanced | Planned | Delay/status rule survives restart |
@@ -24,4 +24,4 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 
 ## Next implementation PR
 
-Extend HTTP request/response body inspection with a bounded redaction design. Prepare consent-based CA/TLS inspection separately from the implemented opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
+Add structured body redaction and request body inspection on top of the implemented paged response storage. Extend body navigation with JSON formatting/search and explicit export. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.

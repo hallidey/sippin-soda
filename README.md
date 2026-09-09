@@ -8,7 +8,7 @@ An open-source desktop project for Windows, macOS and Linux, designed to observe
 
 ## Current state
 
-**Desktop proxy development preview.** The Tauri desktop app starts/stops a real loopback HTTP proxy backed by an independent Rust engine. Traffic shows real HTTP request/response metadata and opaque CONNECT tunnels for HTTPS. Tunnel captures show destination, CONNECT result, duration and transport byte counts; encrypted API content stays invisible. Capture history is bounded and kept in memory; bodies are streamed without being recorded. TLS interception, replay, modification and disk sessions are not implemented yet. No CA is installed and no system proxy setting is changed.
+**Desktop proxy development preview.** The Tauri desktop app starts/stops a real loopback HTTP proxy backed by an independent Rust engine. Traffic shows real HTTP metadata and opaque CONNECT tunnels for HTTPS. Optional HTTP response body recording streams to temporary local files, with paged text/hex inspection and gzip/deflate/Brotli decoding. No per-response size cap is imposed: a configurable session disk budget bounds storage, while each inspector read is at most 64 KiB. Raw body recording is off by default and is not redacted or encrypted at rest. TLS interception, request body inspection, replay, modification and portable sessions are not implemented yet. No CA is installed and no system proxy setting is changed.
 
 Follow the [local HTTP walkthrough](docs/HTTP_PROXY.md) to send traffic through Sippin Soda to the included fixture server.
 
