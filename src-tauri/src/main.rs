@@ -1,8 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use sippin_soda_engine::{BodyPage, JsonStatus, ProxyConfig, ProxyEngine, SearchStep, Snapshot};
+use serde::Serialize;
+use sippin_soda_engine::{
+    BodyExportPreview, BodyPage, JsonStatus, ProxyConfig, ProxyEngine, SearchStep, Snapshot,
+};
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyExportResult {
+    path: String,
+    bytes: u64,
+}
 
 #[tauri::command]
 fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
@@ -123,8 +134,52 @@ fn clear_traffic(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
     engine.clear()
 }
 
+#[tauri::command]
+fn body_export_preview(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    direction: String,
+) -> Result<BodyExportPreview, String> {
+    engine.body_export_preview(id, &direction)
+}
+
+#[tauri::command]
+async fn export_body(
+    app: tauri::AppHandle,
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    direction: String,
+    acknowledge_unredacted: bool,
+) -> Result<Option<BodyExportResult>, String> {
+    let preview = engine.body_export_preview(id, &direction)?;
+    if !preview.redacted && !acknowledge_unredacted {
+        return Err("Confirm that the unredacted response was reviewed before exporting.".into());
+    }
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Export captured body")
+        .set_file_name(&preview.suggested_file_name)
+        .add_filter("Body files", &["bin", "json", "txt"])
+        .blocking_save_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let destination = selected
+        .into_path()
+        .map_err(|_| "The selected destination is not a local filesystem path.")?;
+    let bytes = engine
+        .export_body(id, &direction, destination.clone())
+        .await?;
+    Ok(Some(BodyExportResult {
+        path: destination.to_string_lossy().into_owned(),
+        bytes,
+    }))
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(ProxyEngine::default()))
         .setup(|app| {
             let handle = app.handle().clone();
@@ -151,6 +206,8 @@ fn main() {
             search_request_body,
             request_json_view,
             request_json_page,
+            body_export_preview,
+            export_body,
             response_body_page,
             search_response_body,
             response_json_view,

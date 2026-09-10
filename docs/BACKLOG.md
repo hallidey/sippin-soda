@@ -15,7 +15,7 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | F08 Environments/auth | v0.2 / future advanced | Planned | Host-bound credentials and safe environment switch |
 | F09 Diff | v0.3 | Planned | Structural and original/modified comparison |
 | F10 Contracts/discovery | v0.4 | Planned | Schema diagnostics, export and CI exit codes |
-| F11 Sessions/redaction | v0.1 / v0.3 portable | Bounded memory captures, query removal and header allowlist; persistence/export pending | Retention and credential filtering integration tests |
+| F11 Sessions/redaction | v0.1 / v0.3 portable | Bounded memory captures, query/header filtering, redacted JSON request inspection and explicit body export safety preview; session persistence/export pending | Retention and credential filtering integration tests |
 | F12 Client/collections | v0.2 / v0.3 | Planned | Compose/run/save request and generated test |
 | F13 Scenarios | v0.3 | Planned | Atomic activation/reset with visible conflicts |
 | F14 Protocol extensions | Future | Planned | Per-protocol capability matrix and fixtures |
@@ -24,4 +24,4 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 
 ## Next implementation PR
 
-JSON request bodies up to 1 MiB now have recursive built-in sensitive-key redaction plus configurable JSON Pointer paths before disk-backed inspection, while original bytes continue upstream unchanged. Next, add explicit export with a safety preview. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
+Completed request and response inspection bodies now have explicit native-file export with a safety preview; unredacted responses require acknowledgement and large bodies never cross the webview. Next, prepare consent-based CA/TLS inspection separately from opaque CONNECT transport and complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception. Portable session export remains a later F11 slice.

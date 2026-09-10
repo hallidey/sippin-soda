@@ -17,6 +17,17 @@ type SearchStep = {
   done: boolean;
 };
 type JsonStatus = { state: string; error: string | null };
+type ExportPreview = {
+  id: number;
+  direction: "request" | "response";
+  bytes: number;
+  state: string;
+  encoding: string;
+  redacted: boolean;
+  warning: string;
+  suggestedFileName: string;
+};
+type ExportResult = { path: string; bytes: number };
 
 export function ResponseBody({
   id,
@@ -47,6 +58,10 @@ export function ResponseBody({
   const [found, setFound] = useState<number | null>(null);
   const [searchMessage, setSearchMessage] = useState("");
   const [searching, setSearching] = useState(false);
+  const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
+  const [acknowledgeUnredacted, setAcknowledgeUnredacted] = useState(false);
+  const [exportMessage, setExportMessage] = useState("");
+  const [exporting, setExporting] = useState(false);
   const searchRun = useRef(0);
   const mounted = useRef(true);
   useEffect(() => {
@@ -56,6 +71,41 @@ export function ResponseBody({
       searchRun.current += 1;
     };
   }, []);
+  useEffect(() => {
+    setExportPreview(null);
+    setAcknowledgeUnredacted(false);
+    setExportMessage("");
+  }, [id, direction]);
+  const reviewExport = async () => {
+    setExportMessage("");
+    try {
+      setExportPreview(
+        await invoke<ExportPreview>("body_export_preview", { id, direction }),
+      );
+    } catch (cause) {
+      setExportMessage(String(cause));
+    }
+  };
+  const saveExport = async () => {
+    setExporting(true);
+    setExportMessage("");
+    try {
+      const result = await invoke<ExportResult | null>("export_body", {
+        id,
+        direction,
+        acknowledgeUnredacted,
+      });
+      setExportMessage(
+        result
+          ? `Exported ${result.bytes.toLocaleString()} bytes to ${result.path}`
+          : "Export cancelled.",
+      );
+    } catch (cause) {
+      setExportMessage(String(cause));
+    } finally {
+      setExporting(false);
+    }
+  };
   useEffect(() => {
     if (jsonStatus.state !== "building") return;
     let active = true;
@@ -298,6 +348,45 @@ export function ResponseBody({
           disk budget.
         </p>
       )}
+      <div className="body-export">
+        <button
+          disabled={!desktop || pending || page?.state !== "complete" || exporting}
+          onClick={() => void reviewExport()}
+        >
+          Review export
+        </button>
+        {exportPreview && (
+          <div className="export-preview" role="region" aria-label="Export safety preview">
+            <strong>
+              {exportPreview.bytes.toLocaleString()} bytes · {exportPreview.redacted ? "redacted request copy" : "unredacted response"}
+            </strong>
+            <p>{exportPreview.warning}</p>
+            {!exportPreview.redacted && (
+              <label>
+                <input
+                  type="checkbox"
+                  checked={acknowledgeUnredacted}
+                  onChange={(event) =>
+                    setAcknowledgeUnredacted(event.target.checked)
+                  }
+                />{" "}
+                I reviewed this response and understand the exported file may
+                contain sensitive data.
+              </label>
+            )}
+            <button
+              disabled={
+                exporting ||
+                (!exportPreview.redacted && !acknowledgeUnredacted)
+              }
+              onClick={() => void saveExport()}
+            >
+              {exporting ? "Saving…" : "Choose file and export"}
+            </button>
+          </div>
+        )}
+        {exportMessage && <p role="status">{exportMessage}</p>}
+      </div>
       {recordingError || error ? (
         <p role="status">{recordingError || error}</p>
       ) : !page ? (
