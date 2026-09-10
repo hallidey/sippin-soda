@@ -309,6 +309,7 @@ async fn forwards_original_json_but_persists_only_the_redacted_request_copy() {
             port: 0,
             capture_bodies: true,
             body_disk_budget: 1024 * 1024,
+            request_redaction_paths: vec!["/email".into()],
             ..Default::default()
         })
         .await
@@ -335,12 +336,26 @@ async fn forwards_original_json_but_persists_only_the_redacted_request_copy() {
     assert_eq!(capture.request_body_error, None);
     let page = engine.request_body_page(1, 0, 65536).await.unwrap();
     let redacted: serde_json::Value = serde_json::from_slice(&page.bytes).unwrap();
-    assert_eq!(redacted["email"], "dev@example.test");
+    assert_eq!(redacted["email"], "[REDACTED]");
     assert_eq!(redacted["password"], "[REDACTED]");
     assert_eq!(redacted["nested"]["access_token"], "[REDACTED]");
     assert_eq!(redacted["nested"]["count"], 3);
     assert!(!String::from_utf8(page.bytes).unwrap().contains("secret"));
     engine.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_custom_redaction_path_is_rejected_before_listening() {
+    let engine = ProxyEngine::default();
+    assert!(engine
+        .start(ProxyConfig {
+            port: 0,
+            request_redaction_paths: vec!["profile/email".into()],
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert_eq!(engine.snapshot().status.phase, EnginePhase::Stopped);
 }
 
 #[tokio::test]

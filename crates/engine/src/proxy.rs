@@ -41,6 +41,7 @@ pub struct ProxyConfig {
     pub tunnel_timeout: Duration,
     pub capture_bodies: bool,
     pub body_disk_budget: u64,
+    pub request_redaction_paths: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -53,6 +54,7 @@ impl Default for ProxyConfig {
             tunnel_timeout: Duration::from_secs(300),
             capture_bodies: false,
             body_disk_budget: 10 * 1024 * 1024 * 1024,
+            request_redaction_paths: vec![],
         }
     }
 }
@@ -96,6 +98,7 @@ struct State {
     response_bodies: Arc<BodyStore>,
     capture_bodies: bool,
     body_budget: u64,
+    request_redaction_paths: Vec<Vec<String>>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -126,6 +129,7 @@ impl Default for ProxyEngine {
                 response_bodies,
                 capture_bodies: false,
                 body_budget: 0,
+                request_redaction_paths: vec![],
             })),
             running: tokio::sync::Mutex::new(None),
         }
@@ -259,6 +263,8 @@ impl ProxyEngine {
         {
             return Err("Invalid proxy resource limits.".into());
         }
+        let request_redaction_paths =
+            bodies::compile_redaction_paths(&config.request_redaction_paths)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))
             .await
             .map_err(|e| format!("Cannot listen on 127.0.0.1:{}: {e}", config.port))?;
@@ -268,6 +274,7 @@ impl ProxyEngine {
             state.limit = config.capture_limit;
             state.capture_bodies = config.capture_bodies;
             state.body_budget = config.body_disk_budget;
+            state.request_redaction_paths = request_redaction_paths;
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
                     state.request_bodies.remove(capture.id);
@@ -480,6 +487,7 @@ struct RequestBody {
     capture: Option<Vec<u8>>,
     content_type: String,
     limit: usize,
+    redaction_paths: Vec<Vec<String>>,
 }
 
 impl RequestBody {
@@ -496,9 +504,10 @@ impl RequestBody {
         };
         let exchange = self.observed.exchange.clone();
         let content_type = self.content_type.clone();
+        let redaction_paths = self.redaction_paths.clone();
         tokio::spawn(async move {
             if let Err(error) = store
-                .store_redacted_json(exchange.id, bytes, content_type, budget)
+                .store_redacted_json(exchange.id, bytes, content_type, budget, redaction_paths)
                 .await
             {
                 exchange.update(|capture| {
@@ -752,7 +761,10 @@ async fn forward(
         HeaderValue::from_str(authority.as_str())
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid target host."))?,
     );
-    let capture_request = exchange.shared.lock().unwrap().capture_bodies;
+    let (capture_request, request_redaction_paths) = {
+        let state = exchange.shared.lock().unwrap();
+        (state.capture_bodies, state.request_redaction_paths.clone())
+    };
     let request_has_body = !request.body().is_end_stream();
     let request_content_type = request
         .headers()
@@ -789,6 +801,7 @@ async fn forward(
             capture: (capture_request && request_has_body && request_is_json).then(Vec::new),
             content_type: request_content_type,
             limit: 1024 * 1024,
+            redaction_paths: request_redaction_paths,
         },
     );
     let connection = tokio::spawn(async move {

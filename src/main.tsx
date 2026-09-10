@@ -67,6 +67,16 @@ function App() {
   const [port, setPort] = useState("8080");
   const [captureBodies, setCaptureBodies] = useState(false);
   const [diskBudget, setDiskBudget] = useState("10");
+  const [redactionPaths, setRedactionPaths] = useState("");
+  const parsedRedactionPaths = redactionPaths
+    .split(/[\n,]/)
+    .map((path) => path.trim())
+    .filter(Boolean);
+  const validRedactionPaths =
+    parsedRedactionPaths.length <= 64 &&
+    parsedRedactionPaths.every(
+      (path) => path.startsWith("/") && path.length <= 512,
+    );
   const validBudget =
     /^\d+$/.test(diskBudget) &&
     Number(diskBudget) >= 1 &&
@@ -160,7 +170,8 @@ function App() {
                   !desktop ||
                   !status ||
                   busy ||
-                  (!running && (!validPort || !validBudget))
+                  (!running &&
+                    (!validPort || !validBudget || !validRedactionPaths))
                 }
                 onClick={() =>
                   void command(
@@ -171,6 +182,7 @@ function App() {
                           port: Number(port),
                           captureBodies,
                           diskBudgetGib: Number(diskBudget),
+                          requestRedactionPaths: parsedRedactionPaths,
                         },
                   )
                 }
@@ -208,12 +220,31 @@ function App() {
                   onChange={(event) => setDiskBudget(event.target.value)}
                 />
               </label>
+              <label className="redaction-paths">
+                Additional JSON Pointer redactions
+                <textarea
+                  rows={3}
+                  value={redactionPaths}
+                  disabled={running || busy || !desktop}
+                  aria-invalid={!validRedactionPaths}
+                  placeholder={"/customer/email\n/items/*/cardNumber"}
+                  onChange={(event) => setRedactionPaths(event.target.value)}
+                />
+              </label>
+              {!validRedactionPaths && (
+                <p className="error" role="alert">
+                  Use at most 64 JSON Pointers, each beginning with / and no
+                  longer than 512 characters.
+                </p>
+              )}
               <p>
                 Responses have no per-body size cap and remain unredacted.
                 JSON requests up to 1 MiB are redacted before temporary-disk
-                storage; other request formats are not recorded. Body files are
-                read in 64 KiB pages and are not encrypted at rest. Clear,
-                eviction and normal app exit remove them; Stop keeps them available.
+                storage; built-in secret keys are always protected and these
+                additional paths support * for array/object members. Other
+                request formats are not recorded. Body files are read in 64 KiB
+                pages and are not encrypted at rest. Clear, eviction and normal
+                app exit remove them; Stop keeps them available.
               </p>
             </div>
             <Traffic

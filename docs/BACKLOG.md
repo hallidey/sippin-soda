@@ -24,4 +24,4 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 
 ## Next implementation PR
 
-JSON request bodies up to 1 MiB now have recursive built-in sensitive-key redaction before disk-backed inspection, while original bytes continue upstream unchanged. Next, make redaction paths configurable and add explicit export with a safety preview. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.
+JSON request bodies up to 1 MiB now have recursive built-in sensitive-key redaction plus configurable JSON Pointer paths before disk-backed inspection, while original bytes continue upstream unchanged. Next, add explicit export with a safety preview. Prepare consent-based CA/TLS inspection separately from opaque CONNECT transport. Complete the remaining TLS and benchmark gates in ADR 0001 before expanding into interception.

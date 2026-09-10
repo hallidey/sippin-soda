@@ -15,6 +15,7 @@ async fn start_proxy(
     port: u16,
     capture_bodies: bool,
     disk_budget_gib: u32,
+    request_redaction_paths: Vec<String>,
 ) -> Result<Snapshot, String> {
     if !(1..=1024).contains(&disk_budget_gib) {
         return Err("Disk budget must be between 1 and 1024 GiB.".into());
@@ -24,6 +25,7 @@ async fn start_proxy(
             port,
             capture_bodies,
             body_disk_budget: u64::from(disk_budget_gib) * 1024 * 1024 * 1024,
+            request_redaction_paths,
             ..Default::default()
         })
         .await

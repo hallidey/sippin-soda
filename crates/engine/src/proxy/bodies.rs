@@ -93,12 +93,16 @@ impl BodyStore {
         bytes: Vec<u8>,
         content_type: String,
         limit: u64,
+        redaction_paths: Vec<Vec<String>>,
     ) -> Result<(), String> {
         let used = self.used.clone();
         let (file, length) = tokio::task::spawn_blocking(move || {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|_| "Request JSON is invalid or incomplete; original bytes were forwarded but not recorded.".to_string())?;
             redact_json(&mut value);
+            for path in &redaction_paths {
+                redact_path(&mut value, path);
+            }
             let safe = serde_json::to_vec_pretty(&value)
                 .map_err(|_| "Cannot serialize the redacted request body.".to_string())?;
             let length = safe.len() as u64;
@@ -333,6 +337,78 @@ fn redact_json(value: &mut serde_json::Value) {
     }
 }
 
+pub(super) fn compile_redaction_paths(paths: &[String]) -> Result<Vec<Vec<String>>, String> {
+    if paths.len() > 64 {
+        return Err("At most 64 custom request redaction paths are allowed.".into());
+    }
+    paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            let path = path.trim();
+            if path.len() > 512 || !path.starts_with('/') {
+                return Err(
+                    "Redaction paths must be JSON Pointers beginning with '/' and at most 512 characters."
+                        .into(),
+                );
+            }
+            path[1..]
+                .split('/')
+                .map(decode_pointer_segment)
+                .collect()
+        })
+        .collect()
+}
+
+fn decode_pointer_segment(segment: &str) -> Result<String, String> {
+    let mut decoded = String::with_capacity(segment.len());
+    let mut characters = segment.chars();
+    while let Some(character) = characters.next() {
+        if character != '~' {
+            decoded.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('0') => decoded.push('~'),
+            Some('1') => decoded.push('/'),
+            _ => return Err("Redaction paths contain an invalid JSON Pointer escape.".into()),
+        }
+    }
+    Ok(decoded)
+}
+
+fn redact_path(value: &mut serde_json::Value, path: &[String]) {
+    let Some((segment, remaining)) = path.split_first() else {
+        *value = serde_json::Value::String("[REDACTED]".into());
+        return;
+    };
+    match value {
+        serde_json::Value::Object(object) if segment == "*" => {
+            object
+                .values_mut()
+                .for_each(|value| redact_path(value, remaining));
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(value) = object.get_mut(segment) {
+                redact_path(value, remaining);
+            }
+        }
+        serde_json::Value::Array(values) if segment == "*" => {
+            values
+                .iter_mut()
+                .for_each(|value| redact_path(value, remaining));
+        }
+        serde_json::Value::Array(values) => {
+            if let Ok(index) = segment.parse::<usize>() {
+                if let Some(value) = values.get_mut(index) {
+                    redact_path(value, remaining);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) struct Tap {
     input: Option<DuplexStream>,
     task: JoinHandle<()>,
@@ -433,7 +509,7 @@ impl Body for RecordedBody {
 
 #[cfg(test)]
 mod redaction_tests {
-    use super::{redact_json, BodyStore};
+    use super::{compile_redaction_paths, redact_json, redact_path, BodyStore};
 
     #[test]
     fn redacts_sensitive_keys_recursively_without_changing_safe_values() {
@@ -451,16 +527,38 @@ mod redaction_tests {
         assert_eq!(value["items"][0]["client-secret"], "[REDACTED]");
     }
 
+    #[test]
+    fn custom_json_pointers_support_arrays_wildcards_and_escapes() {
+        let paths = compile_redaction_paths(&[
+            "/customers/*/email".into(),
+            "/metadata/card~1number".into(),
+        ])
+        .unwrap();
+        let mut value = serde_json::json!({
+            "customers": [{"email": "one@test"}, {"email": "two@test"}],
+            "metadata": {"card/number": "4111", "safe": true}
+        });
+        for path in &paths {
+            redact_path(&mut value, path);
+        }
+        assert_eq!(value["customers"][0]["email"], "[REDACTED]");
+        assert_eq!(value["customers"][1]["email"], "[REDACTED]");
+        assert_eq!(value["metadata"]["card/number"], "[REDACTED]");
+        assert_eq!(value["metadata"]["safe"], true);
+        assert!(compile_redaction_paths(&["customers/email".into()]).is_err());
+        assert!(compile_redaction_paths(&["/bad~2escape".into()]).is_err());
+    }
+
     #[tokio::test]
     async fn request_and_response_stores_share_one_session_budget() {
         let (request, response) = BodyStore::shared_pair();
         let body = format!(r#"{{"safe":"{}"}}"#, "x".repeat(60)).into_bytes();
         request
-            .store_redacted_json(1, body.clone(), "application/json".into(), 100)
+            .store_redacted_json(1, body.clone(), "application/json".into(), 100, vec![])
             .await
             .unwrap();
         assert!(response
-            .store_redacted_json(2, body, "application/json".into(), 100)
+            .store_redacted_json(2, body, "application/json".into(), 100, vec![])
             .await
             .is_err());
     }
