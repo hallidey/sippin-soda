@@ -68,6 +68,25 @@ function App() {
   const [captureBodies, setCaptureBodies] = useState(false);
   const [diskBudget, setDiskBudget] = useState("10");
   const [redactionPaths, setRedactionPaths] = useState("");
+  const [developmentHosts, setDevelopmentHosts] = useState("");
+  const [productionHosts, setProductionHosts] = useState("");
+  const parseHostRules = (value: string) =>
+    value
+      .split(/[\n,]/)
+      .map((host) => host.trim())
+      .filter(Boolean);
+  const parsedDevelopmentHosts = parseHostRules(developmentHosts);
+  const parsedProductionHosts = parseHostRules(productionHosts);
+  const hostRuleIsPlausible = (host: string) =>
+    host.length <= 253 &&
+    /^[\x21-\x7e]+$/.test(host) &&
+    (!host.includes("*") || (host.startsWith("*.") && !host.slice(2).includes("*")));
+  const validHostRules =
+    parsedDevelopmentHosts.length <= 128 &&
+    parsedProductionHosts.length <= 128 &&
+    [...parsedDevelopmentHosts, ...parsedProductionHosts].every(
+      hostRuleIsPlausible,
+    );
   const parsedRedactionPaths = redactionPaths
     .split(/[\n,]/)
     .map((path) => path.trim())
@@ -171,7 +190,10 @@ function App() {
                   !status ||
                   busy ||
                   (!running &&
-                    (!validPort || !validBudget || !validRedactionPaths))
+                    (!validPort ||
+                      !validBudget ||
+                      !validRedactionPaths ||
+                      !validHostRules))
                 }
                 onClick={() =>
                   void command(
@@ -183,6 +205,8 @@ function App() {
                           captureBodies,
                           diskBudgetGib: Number(diskBudget),
                           requestRedactionPaths: parsedRedactionPaths,
+                          developmentHosts: parsedDevelopmentHosts,
+                          productionHosts: parsedProductionHosts,
                         },
                   )
                 }
@@ -237,6 +261,42 @@ function App() {
                   longer than 512 characters.
                 </p>
               )}
+              <div className="destination-rules">
+                <label className="redaction-paths">
+                  Development hosts
+                  <textarea
+                    rows={3}
+                    value={developmentHosts}
+                    disabled={running || busy || !desktop}
+                    aria-invalid={!validHostRules}
+                    placeholder={"api.dev.example\n*.internal"}
+                    onChange={(event) => setDevelopmentHosts(event.target.value)}
+                  />
+                </label>
+                <label className="redaction-paths">
+                  Production hosts
+                  <textarea
+                    rows={3}
+                    value={productionHosts}
+                    disabled={running || busy || !desktop}
+                    aria-invalid={!validHostRules}
+                    placeholder={"api.example.com\n*.prod.example"}
+                    onChange={(event) => setProductionHosts(event.target.value)}
+                  />
+                </label>
+              </div>
+              {!validHostRules && (
+                <p className="error" role="alert">
+                  Use at most 128 ASCII host rules per class. Wildcards must be
+                  the leading form *.example.com.
+                </p>
+              )}
+              <p>
+                Destination safety uses the effective target host. Loopback is
+                Development automatically; configured rules may use an exact
+                host or a leading wildcard. Unlisted destinations remain
+                Unknown, and Development/Production overlaps are rejected.
+              </p>
               <p>
                 Responses have no per-body size cap and remain unredacted.
                 JSON requests up to 1 MiB are redacted before temporary-disk

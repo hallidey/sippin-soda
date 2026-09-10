@@ -7,6 +7,7 @@ export type Capture = {
   kind: "http" | "tunnel";
   method: string;
   target: string;
+  destinationClass: "development" | "production" | "unknown";
   startedAt: number;
   status: number | null;
   phase: "pending" | "complete" | "error";

@@ -89,7 +89,7 @@ export function Traffic({
         <table>
           <thead>
             <tr>
-              {["METHOD / TARGET", "STATUS", "TIME", "RECEIVED"].map(
+              {["METHOD / TARGET", "SAFETY", "STATUS", "TIME", "RECEIVED"].map(
                 (label) => (
                   <th key={label}>{label}</th>
                 ),
@@ -100,7 +100,7 @@ export function Traffic({
             {filtered.map((capture) => (
               <tr
                 key={capture.id}
-                className={selectedId === capture.id ? "active-row" : ""}
+                className={`${selectedId === capture.id ? "active-row" : ""} safety-${capture.destinationClass}`}
               >
                 <td>
                   <button
@@ -111,6 +111,11 @@ export function Traffic({
                     <b>{capture.method}</b>
                     <span>{capture.target}</span>
                   </button>
+                </td>
+                <td>
+                  <span className={`safety-badge ${capture.destinationClass}`}>
+                    {capture.destinationClass}
+                  </span>
                 </td>
                 <td>
                   {capture.phase === "error"
@@ -165,6 +170,10 @@ export function Traffic({
             <h2>
               {selected.method} {selected.target}
             </h2>
+            <p className={`destination-class ${selected.destinationClass}`}>
+              Effective destination: {selected.destinationClass}. Production
+              Safety Mode applies to active operations using this classification.
+            </p>
             {selected.kind === "tunnel" && (
               <p className="capture-notice">
                 Opaque CONNECT tunnel. Status 200 means the tunnel opened; the
