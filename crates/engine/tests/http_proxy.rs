@@ -341,6 +341,22 @@ async fn forwards_original_json_but_persists_only_the_redacted_request_copy() {
     assert_eq!(redacted["nested"]["access_token"], "[REDACTED]");
     assert_eq!(redacted["nested"]["count"], 3);
     assert!(!String::from_utf8(page.bytes).unwrap().contains("secret"));
+    let preview = engine.body_export_preview(1, "request").unwrap();
+    assert!(preview.redacted);
+    assert_eq!(preview.state, "complete");
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("request.json");
+    assert_eq!(
+        engine
+            .export_body(1, "request", destination.clone())
+            .await
+            .unwrap(),
+        preview.bytes
+    );
+    let exported: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(destination).unwrap()).unwrap();
+    assert_eq!(exported["email"], "[REDACTED]");
+    assert_eq!(exported["password"], "[REDACTED]");
     engine.stop().await;
 }
 

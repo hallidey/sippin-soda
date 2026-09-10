@@ -348,6 +348,26 @@ async fn wait_json(engine: &ProxyEngine) -> sippin_soda_engine::JsonStatus {
 }
 
 #[tokio::test]
+async fn response_export_preview_marks_unredacted_content_and_copies_all_bytes() {
+    let original = b"private-response-body".to_vec();
+    let engine = record_payload(original.clone(), 1024 * 1024).await;
+    let preview = engine.body_export_preview(1, "response").unwrap();
+    assert!(!preview.redacted);
+    assert_eq!(preview.bytes, original.len() as u64);
+    assert!(preview.warning.contains("unredacted"));
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("response.bin");
+    assert_eq!(
+        engine
+            .export_body(1, "response", destination.clone())
+            .await
+            .unwrap(),
+        original.len() as u64
+    );
+    assert_eq!(std::fs::read(destination).unwrap(), original);
+}
+
+#[tokio::test]
 async fn json_layout_preserves_numbers_duplicate_keys_and_escapes() {
     let original = br#"{"n":9007199254740993123456789,"n":1e9999,"s":"a\"b\\c\u0041","empty":[]}"#;
     let engine = record_payload(original.to_vec(), 1024 * 1024).await;

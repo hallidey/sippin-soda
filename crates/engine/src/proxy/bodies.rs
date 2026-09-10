@@ -22,6 +22,13 @@ pub struct BodyPage {
     pub encoding: String,
 }
 
+pub(super) struct BodyInfo {
+    pub total: u64,
+    pub state: String,
+    pub error: Option<String>,
+    pub encoding: String,
+}
+
 struct Entry {
     json: Mutex<inspect::JsonView>,
     limit: u64,
@@ -75,6 +82,63 @@ impl Default for BodyStore {
     }
 }
 impl BodyStore {
+    pub fn info(&self, id: u64) -> Result<BodyInfo, String> {
+        let entry = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or("Body not recorded, cleared or evicted.")?;
+        let (state, error) = entry.result.lock().unwrap().clone();
+        Ok(BodyInfo {
+            total: entry.total.load(Ordering::Acquire),
+            state,
+            error,
+            encoding: entry.encoding.clone(),
+        })
+    }
+
+    pub async fn export(&self, id: u64, destination: std::path::PathBuf) -> Result<u64, String> {
+        let entry = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or("Body not recorded, cleared or evicted.")?;
+        tokio::task::spawn_blocking(move || {
+            let (state, error) = entry.result.lock().unwrap().clone();
+            if state != "complete" {
+                return Err(error.unwrap_or_else(|| {
+                    "Only a complete body can be exported; wait for recording to finish.".into()
+                }));
+            }
+            let mut source = entry
+                .file
+                .lock()
+                .unwrap()
+                .as_ref()
+                .ok_or("Body cleared or evicted.")?
+                .reopen()
+                .map_err(|_| "Cannot open the recorded body for export.")?;
+            let mut output = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(destination)
+                .map_err(|_| "Cannot create the selected export file.")?;
+            let copied = std::io::copy(&mut source, &mut output)
+                .map_err(|_| "Body export failed; the destination file may be incomplete.")?;
+            output
+                .flush()
+                .map_err(|_| "Cannot flush the exported body.")?;
+            Ok(copied)
+        })
+        .await
+        .map_err(|_| "Body export worker failed.".to_string())?
+    }
+
     pub(super) fn shared_pair() -> (Arc<Self>, Arc<Self>) {
         let used = Arc::new(AtomicU64::new(0));
         let analysis = Arc::new(tokio::sync::Semaphore::new(2));

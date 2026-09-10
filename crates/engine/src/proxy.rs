@@ -88,6 +88,19 @@ pub struct Snapshot {
     pub traffic: Vec<Capture>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyExportPreview {
+    pub id: u64,
+    pub direction: String,
+    pub bytes: u64,
+    pub state: String,
+    pub encoding: String,
+    pub redacted: bool,
+    pub warning: String,
+    pub suggested_file_name: String,
+}
+
 struct State {
     revision: u64,
     next_id: u64,
@@ -137,6 +150,75 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub fn body_export_preview(
+        &self,
+        id: u64,
+        direction: &str,
+    ) -> Result<BodyExportPreview, String> {
+        let state = self.shared.lock().unwrap();
+        let capture = state
+            .traffic
+            .iter()
+            .find(|capture| capture.id == id)
+            .ok_or("Capture cleared or evicted.")?;
+        let (store, redacted, error) = match direction {
+            "request" => (
+                state.request_bodies.clone(),
+                true,
+                capture.request_body_error.as_ref(),
+            ),
+            "response" => (
+                state.response_bodies.clone(),
+                false,
+                capture.response_body_error.as_ref(),
+            ),
+            _ => return Err("Body direction must be request or response.".into()),
+        };
+        if let Some(error) = error {
+            return Err(error.clone());
+        }
+        let info = store.info(id)?;
+        if info.state != "complete" {
+            return Err(info.error.unwrap_or_else(|| {
+                "Only a complete body can be exported; wait for recording to finish.".into()
+            }));
+        }
+        Ok(BodyExportPreview {
+            id,
+            direction: direction.into(),
+            bytes: info.total,
+            state: info.state,
+            encoding: info.encoding,
+            redacted,
+            warning: if redacted {
+                "This exports the redacted JSON inspection copy, not the original request bytes. Review custom fields before sharing it."
+                    .into()
+            } else {
+                "This response body is unredacted and may contain credentials or personal data. Review it before sharing."
+                    .into()
+            },
+            suggested_file_name: format!(
+                "sippin-{id}-{direction}.{}",
+                if redacted { "json" } else { "bin" }
+            ),
+        })
+    }
+
+    pub async fn export_body(
+        &self,
+        id: u64,
+        direction: &str,
+        destination: std::path::PathBuf,
+    ) -> Result<u64, String> {
+        self.body_export_preview(id, direction)?;
+        let store = match direction {
+            "request" => self.shared.lock().unwrap().request_bodies.clone(),
+            "response" => self.shared.lock().unwrap().response_bodies.clone(),
+            _ => return Err("Body direction must be request or response.".into()),
+        };
+        store.export(id, destination).await
+    }
+
     pub async fn search_request_body(
         &self,
         id: u64,
