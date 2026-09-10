@@ -42,6 +42,7 @@ impl Default for EngineStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Observe,
+    InspectTls,
     Replay,
     Modify,
     InjectFault,
@@ -99,7 +100,12 @@ mod tests {
 
     #[test]
     fn production_and_unknown_destinations_reject_all_active_operations() {
-        for action in [Action::Replay, Action::Modify, Action::InjectFault] {
+        for action in [
+            Action::InspectTls,
+            Action::Replay,
+            Action::Modify,
+            Action::InjectFault,
+        ] {
             assert_eq!(
                 authorize(DestinationClass::Production, action),
                 Err(PolicyError::ProductionReadOnly)
