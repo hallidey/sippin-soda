@@ -373,6 +373,24 @@ select {
   background: var(--line);
   margin: 30px 0;
 }
+.ca-panel {
+  max-width: 720px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.ca-panel button {
+  margin: 8px 8px 8px 0;
+}
+.ca-panel .fingerprint {
+  font-family: Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.ca-panel .danger-confirmation {
+  display: block;
+  margin-top: 16px;
+}
 dl {
   display: grid;
   grid-template-columns: 180px 1fr;

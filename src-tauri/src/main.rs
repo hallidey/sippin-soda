@@ -2,7 +2,8 @@
 
 use serde::Serialize;
 use sippin_soda_engine::{
-    BodyExportPreview, BodyPage, JsonStatus, ProxyConfig, ProxyEngine, SearchStep, Snapshot,
+    BodyExportPreview, BodyPage, CaManager, CaStatus, JsonStatus, ProxyConfig, ProxyEngine,
+    SearchStep, Snapshot,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -181,10 +182,68 @@ async fn export_body(
     }))
 }
 
+#[tauri::command]
+async fn ca_status(ca: tauri::State<'_, Arc<CaManager>>) -> Result<CaStatus, String> {
+    let ca = ca.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || ca.status())
+        .await
+        .map_err(|_| "Local CA status worker failed.".to_string())?
+}
+
+#[tauri::command]
+async fn generate_local_ca(
+    ca: tauri::State<'_, Arc<CaManager>>,
+    consent: bool,
+) -> Result<CaStatus, String> {
+    let ca = ca.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || ca.generate(consent))
+        .await
+        .map_err(|_| "Local CA generation worker failed.".to_string())?
+}
+
+#[tauri::command]
+async fn remove_local_ca(
+    ca: tauri::State<'_, Arc<CaManager>>,
+    confirmed: bool,
+) -> Result<CaStatus, String> {
+    let ca = ca.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || ca.remove(confirmed))
+        .await
+        .map_err(|_| "Local CA removal worker failed.".to_string())?
+}
+
+#[tauri::command]
+async fn export_local_ca(
+    app: tauri::AppHandle,
+    ca: tauri::State<'_, Arc<CaManager>>,
+) -> Result<Option<String>, String> {
+    let ca = ca.inner().clone();
+    let certificate = tauri::async_runtime::spawn_blocking(move || ca.certificate_pem())
+        .await
+        .map_err(|_| "Local CA export worker failed.".to_string())??;
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Export Sippin Soda public CA certificate")
+        .set_file_name("sippin-soda-local-ca.pem")
+        .add_filter("PEM certificate", &["pem", "crt"])
+        .blocking_save_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let destination = selected
+        .into_path()
+        .map_err(|_| "The selected destination is not a local filesystem path.")?;
+    std::fs::write(&destination, certificate)
+        .map_err(|_| "Cannot write the public CA certificate to the selected file.")?;
+    Ok(Some(destination.to_string_lossy().into_owned()))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(ProxyEngine::default()))
+        .manage(Arc::new(CaManager::default()))
         .setup(|app| {
             let handle = app.handle().clone();
             let engine = app.state::<Arc<ProxyEngine>>().inner().clone();
@@ -212,6 +271,10 @@ fn main() {
             request_json_page,
             body_export_preview,
             export_body,
+            ca_status,
+            generate_local_ca,
+            remove_local_ca,
+            export_local_ca,
             response_body_page,
             search_response_body,
             response_json_view,

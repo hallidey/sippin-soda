@@ -20,8 +20,8 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | F13 Scenarios | v0.3 | Planned | Atomic activation/reset with visible conflicts |
 | F14 Protocol extensions | Future | Planned | Per-protocol capability matrix and fixtures |
 | F15 CLI/plugins | v0.4 / future | Planned | Shared policy semantics; headless contract checks |
-| F16 TLS/production safety | v0.1 onward | Pure active-operation policy, effective-host classifier, visible safety class and opaque CONNECT; no TLS interception yet | Classification/overlap and pass-through TLS fixtures implemented; route revalidation and interception fixtures pending |
+| F16 TLS/production safety | v0.1 onward | Active-operation policy, effective-host classifier, visible safety class, opaque CONNECT and consent-based local CA generation in OS credential storage; CA is not installed and TLS interception remains off | Classification/overlap, CA generation and pass-through TLS fixtures implemented; trust lifecycle, route revalidation and interception fixtures pending |
 
 ## Next implementation PR
 
-Effective HTTP/CONNECT destinations now have validated Development, Production and Unknown classification based on the actual target rather than request headers; ambiguous policies fail startup and the class stays visible per capture. Next, prepare consent-based CA/TLS inspection separately from opaque CONNECT transport, revalidate redirects/routes as those capabilities arrive, and complete the benchmark gates in ADR 0001 before expanding into interception. Portable session export remains a later F11 slice.
+The app can now generate a consent-based local development CA in operating-system credential storage, display its fingerprint/lifetime, export only the public certificate and remove owned material without touching trust stores; HTTPS interception stays explicitly disabled. Next, add leaf issuance and an isolated TLS interception fixture with strict upstream verification before considering any trust-store workflow. Complete the benchmark gates in ADR 0001 before expanding into interception. Portable session export remains a later F11 slice.
