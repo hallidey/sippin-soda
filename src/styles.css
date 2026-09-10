@@ -668,6 +668,35 @@ input:focus-visible {
   resize: vertical;
   font-family: Consolas, monospace;
 }
+.destination-rules {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.safety-badge,
+.destination-class {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  font-weight: 700;
+}
+.safety-badge.production,
+.destination-class.production {
+  color: var(--danger, #c43d3d);
+}
+.safety-badge.development,
+.destination-class.development {
+  color: var(--success, #438b57);
+}
+.safety-badge.unknown,
+.destination-class.unknown {
+  color: var(--muted);
+}
+@media (max-width: 800px) {
+  .destination-rules {
+    grid-template-columns: 1fr;
+  }
+}
 .body-toolbar input:not([type="checkbox"]) {
   width: 150px;
 }

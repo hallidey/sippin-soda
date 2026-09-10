@@ -81,6 +81,10 @@ async fn preserves_early_bytes_half_close_and_bidirectional_counts() {
     assert_eq!(capture.kind, "tunnel");
     assert_eq!(capture.phase, "complete");
     assert_eq!(capture.status, Some(200));
+    assert_eq!(
+        capture.destination_class,
+        sippin_soda_engine::DestinationClass::Development
+    );
     assert_eq!(capture.request_bytes, 11);
     assert_eq!(capture.response_bytes, 15);
     assert!(capture.response_headers.is_empty());

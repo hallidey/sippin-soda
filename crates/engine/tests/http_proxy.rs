@@ -74,6 +74,10 @@ async fn forwards_to_real_upstream_and_captures_only_filtered_metadata() {
     let snapshot = engine.stop().await;
     let capture = &snapshot.traffic[0];
     assert_eq!(capture.status, Some(201));
+    assert_eq!(
+        capture.destination_class,
+        sippin_soda_engine::DestinationClass::Development
+    );
     assert_eq!(capture.phase, "complete");
     assert_eq!(capture.response_bytes, 5);
     assert!(!capture.target.contains("private"));
@@ -85,6 +89,31 @@ async fn forwards_to_real_upstream_and_captures_only_filtered_metadata() {
         .response_headers
         .iter()
         .any(|(name, value)| name == "set-cookie" && value == "[REDACTED]"));
+}
+
+#[tokio::test]
+async fn explicit_production_rule_classifies_the_effective_upstream_host() {
+    let (upstream, _) = fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            production_hosts: vec!["127.0.0.1".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: ignored.test\r\n\r\n")
+    )
+    .await
+    .starts_with("HTTP/1.1 204"));
+    let capture = engine.stop().await.traffic.remove(0);
+    assert_eq!(
+        capture.destination_class,
+        sippin_soda_engine::DestinationClass::Production
+    );
 }
 
 #[tokio::test]

@@ -47,7 +47,8 @@ pub enum Action {
 
 /// Destination classification is supplied by the future routing layer.
 /// Unknown destinations fail closed for active operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationClass {
     Development,
     Production,

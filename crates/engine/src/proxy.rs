@@ -1,4 +1,4 @@
-use crate::{EnginePhase, EngineStatus};
+use crate::{DestinationClass, EnginePhase, EngineStatus};
 mod bodies;
 mod tunnel;
 pub use bodies::{BodyPage, JsonStatus, SearchStep};
@@ -42,6 +42,8 @@ pub struct ProxyConfig {
     pub capture_bodies: bool,
     pub body_disk_budget: u64,
     pub request_redaction_paths: Vec<String>,
+    pub development_hosts: Vec<String>,
+    pub production_hosts: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -55,6 +57,8 @@ impl Default for ProxyConfig {
             capture_bodies: false,
             body_disk_budget: 10 * 1024 * 1024 * 1024,
             request_redaction_paths: vec![],
+            development_hosts: vec![],
+            production_hosts: vec![],
         }
     }
 }
@@ -66,6 +70,7 @@ pub struct Capture {
     pub kind: String,
     pub method: String,
     pub target: String,
+    pub destination_class: DestinationClass,
     pub started_at: u64,
     pub status: Option<u16>,
     pub phase: String,
@@ -86,6 +91,139 @@ pub struct Snapshot {
     pub revision: u64,
     pub status: EngineStatus,
     pub traffic: Vec<Capture>,
+}
+
+#[derive(Clone)]
+enum HostPattern {
+    Exact(String),
+    Suffix(String),
+}
+
+impl HostPattern {
+    fn compile(value: &str) -> Result<Self, String> {
+        let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+        if value.is_empty() || value.len() > 253 || !value.is_ascii() {
+            return Err(
+                "Destination host rules must be non-empty ASCII names up to 253 characters.".into(),
+            );
+        }
+        if let Some(suffix) = value.strip_prefix("*.") {
+            if suffix.is_empty() || suffix.contains('*') || !valid_hostname(suffix) {
+                return Err("Host wildcards must use the form *.example.com.".into());
+            }
+            Ok(Self::Suffix(suffix.into()))
+        } else if value.contains('*') {
+            Err("Host wildcards must use the form *.example.com.".into())
+        } else {
+            let unbracketed = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(&value);
+            if unbracketed.parse::<std::net::IpAddr>().is_err() && !valid_hostname(unbracketed) {
+                return Err(
+                    "Host rules must be DNS names or IP addresses without a port or URL scheme."
+                        .into(),
+                );
+            }
+            Ok(Self::Exact(unbracketed.into()))
+        }
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            Self::Exact(expected) => host == expected,
+            Self::Suffix(suffix) => {
+                host.len() > suffix.len()
+                    && host.ends_with(suffix)
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            }
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exact(left), Self::Exact(right)) => left == right,
+            (Self::Exact(host), pattern) | (pattern, Self::Exact(host)) => pattern.matches(host),
+            (Self::Suffix(left), Self::Suffix(right)) => {
+                left == right
+                    || left.ends_with(&format!(".{right}"))
+                    || right.ends_with(&format!(".{left}"))
+            }
+        }
+    }
+}
+
+fn valid_hostname(value: &str) -> bool {
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
+#[derive(Clone, Default)]
+struct DestinationClassifier {
+    development: Vec<HostPattern>,
+    production: Vec<HostPattern>,
+}
+
+impl DestinationClassifier {
+    fn compile(development: &[String], production: &[String]) -> Result<Self, String> {
+        if development.len() > 128 || production.len() > 128 {
+            return Err(
+                "At most 128 Development and 128 Production host rules are allowed.".into(),
+            );
+        }
+        let development = development
+            .iter()
+            .map(|value| HostPattern::compile(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let production = production
+            .iter()
+            .map(|value| HostPattern::compile(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        if development
+            .iter()
+            .any(|dev| production.iter().any(|prod| dev.overlaps(prod)))
+        {
+            return Err(
+                "Development and Production host rules overlap; classification must be unambiguous."
+                    .into(),
+            );
+        }
+        Ok(Self {
+            development,
+            production,
+        })
+    }
+
+    fn classify(&self, host: &str) -> DestinationClass {
+        let host = host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if self.production.iter().any(|pattern| pattern.matches(&host)) {
+            DestinationClass::Production
+        } else if self
+            .development
+            .iter()
+            .any(|pattern| pattern.matches(&host))
+            || host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        {
+            DestinationClass::Development
+        } else {
+            DestinationClass::Unknown
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +250,7 @@ struct State {
     capture_bodies: bool,
     body_budget: u64,
     request_redaction_paths: Vec<Vec<String>>,
+    destination_classifier: DestinationClassifier,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -143,6 +282,7 @@ impl Default for ProxyEngine {
                 capture_bodies: false,
                 body_budget: 0,
                 request_redaction_paths: vec![],
+                destination_classifier: DestinationClassifier::default(),
             })),
             running: tokio::sync::Mutex::new(None),
         }
@@ -347,6 +487,8 @@ impl ProxyEngine {
         }
         let request_redaction_paths =
             bodies::compile_redaction_paths(&config.request_redaction_paths)?;
+        let destination_classifier =
+            DestinationClassifier::compile(&config.development_hosts, &config.production_hosts)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))
             .await
             .map_err(|e| format!("Cannot listen on 127.0.0.1:{}: {e}", config.port))?;
@@ -357,6 +499,7 @@ impl ProxyEngine {
             state.capture_bodies = config.capture_bodies;
             state.body_budget = config.body_disk_budget;
             state.request_redaction_paths = request_redaction_paths;
+            state.destination_classifier = destination_classifier;
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
                     state.request_bodies.remove(capture.id);
@@ -722,6 +865,12 @@ async fn handle(
     deadline: Duration,
     tunnel_slot: Arc<Mutex<Option<oneshot::Sender<Tunnel>>>>,
 ) -> Result<Response<WireBody>, Infallible> {
+    let destination_class = {
+        let state = shared.lock().unwrap();
+        state
+            .destination_classifier
+            .classify(request.uri().host().unwrap_or(""))
+    };
     let exchange = {
         let mut state = shared.lock().unwrap();
         let id = state.next_id;
@@ -743,6 +892,7 @@ async fn handle(
             .into(),
             method: request.method().to_string(),
             target: safe_target(&request),
+            destination_class,
             started_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1024,5 +1174,61 @@ impl Body for ResponseBody {
     }
     fn size_hint(&self) -> SizeHint {
         self.observed.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::DestinationClassifier;
+    use crate::DestinationClass;
+
+    #[test]
+    fn classifies_exact_wildcard_loopback_and_unknown_hosts() {
+        let classifier = DestinationClassifier::compile(
+            &["api.dev.example".into(), "*.internal".into()],
+            &["api.example.com".into(), "*.prod.example".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            classifier.classify("API.DEV.EXAMPLE."),
+            DestinationClass::Development
+        );
+        assert_eq!(
+            classifier.classify("orders.internal"),
+            DestinationClass::Development
+        );
+        assert_eq!(
+            classifier.classify("127.0.0.1"),
+            DestinationClass::Development
+        );
+        assert_eq!(
+            classifier.classify("api.example.com"),
+            DestinationClass::Production
+        );
+        assert_eq!(
+            classifier.classify("payments.prod.example"),
+            DestinationClass::Production
+        );
+        assert_eq!(
+            classifier.classify("prod.example"),
+            DestinationClass::Unknown
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_host_rules() {
+        assert!(DestinationClassifier::compile(&["api.*.test".into()], &[]).is_err());
+        assert!(DestinationClassifier::compile(&["https://api.test".into()], &[]).is_err());
+        assert!(DestinationClassifier::compile(&["api.test:443".into()], &[]).is_err());
+        assert!(DestinationClassifier::compile(
+            &["api.example.com".into()],
+            &["*.example.com".into()]
+        )
+        .is_err());
+        assert!(DestinationClassifier::compile(
+            &["*.dev.example.com".into()],
+            &["*.example.com".into()]
+        )
+        .is_err());
     }
 }
