@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rcgen = "0.14"
+keyring = "4"
+sha2 = "0.10"
+time = "0.3"
+zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "fs"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -17,4 +22,3 @@ async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "bro
 
 [dev-dependencies]
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rcgen = "0.14"

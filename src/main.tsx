@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import { useEngine } from "./engine";
 import { Traffic } from "./Traffic";
 import "./styles.css";
@@ -15,6 +16,14 @@ const sections = [
   "Settings",
 ] as const;
 type Section = (typeof sections)[number];
+type CaStatus = {
+  state: "absent" | "ready";
+  fingerprintSha256: string | null;
+  createdAt: number | null;
+  expiresAt: number | null;
+  installedByApp: boolean;
+  httpsInspection: boolean;
+};
 const descriptions: Record<Section, string> = {
   Traffic: "Your application’s traffic, in one place.",
   Collections: "Compose requests and keep repeatable workflows together.",
@@ -70,6 +79,11 @@ function App() {
   const [redactionPaths, setRedactionPaths] = useState("");
   const [developmentHosts, setDevelopmentHosts] = useState("");
   const [productionHosts, setProductionHosts] = useState("");
+  const [caStatus, setCaStatus] = useState<CaStatus | null>(null);
+  const [caConsent, setCaConsent] = useState(false);
+  const [caRemoveConfirmed, setCaRemoveConfirmed] = useState(false);
+  const [caBusy, setCaBusy] = useState(false);
+  const [caMessage, setCaMessage] = useState("");
   const parseHostRules = (value: string) =>
     value
       .split(/[\n,]/)
@@ -107,6 +121,56 @@ function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("sippin-theme", theme);
   }, [theme]);
+  useEffect(() => {
+    if (!desktop) return;
+    let active = true;
+    void invoke<CaStatus>("ca_status")
+      .then((next) => {
+        if (active) setCaStatus(next);
+      })
+      .catch((cause) => {
+        if (active) setCaMessage(String(cause));
+      });
+    return () => {
+      active = false;
+    };
+  }, [desktop]);
+  const caCommand = async (
+    name: "generate_local_ca" | "remove_local_ca",
+    args: Record<string, unknown>,
+  ) => {
+    setCaBusy(true);
+    setCaMessage("");
+    try {
+      const next = await invoke<CaStatus>(name, args);
+      setCaStatus(next);
+      setCaConsent(false);
+      setCaRemoveConfirmed(false);
+      setCaMessage(
+        next.state === "ready"
+          ? "Local CA generated in the operating-system credential store. It has not been installed or trusted."
+          : "Local CA material removed from the credential store.",
+      );
+    } catch (cause) {
+      setCaMessage(String(cause));
+    } finally {
+      setCaBusy(false);
+    }
+  };
+  const exportCa = async () => {
+    setCaBusy(true);
+    setCaMessage("");
+    try {
+      const path = await invoke<string | null>("export_local_ca");
+      setCaMessage(
+        path ? `Public CA certificate exported to ${path}` : "Export cancelled.",
+      );
+    } catch (cause) {
+      setCaMessage(String(cause));
+    } finally {
+      setCaBusy(false);
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -341,7 +405,11 @@ function App() {
               <dt>Listen address</dt>
               <dd>{status?.listenAddress ?? "127.0.0.1:8080"}</dd>
               <dt>HTTPS inspection</dt>
-              <dd>Not available · no CA installed</dd>
+              <dd>
+                {caStatus?.state === "ready"
+                  ? "Disabled · local CA generated but not installed"
+                  : "Disabled · no local CA generated"}
+              </dd>
               <dt>HTTPS pass-through</dt>
               <dd>CONNECT supported · 5 minute tunnel limit</dd>
               <dt>Production policy</dt>
@@ -351,6 +419,79 @@ function App() {
                   : "Read-only by design"}
               </dd>
             </dl>
+            <div className="settings-divider" />
+            <h2>HTTPS inspection foundation</h2>
+            <p>
+              Generate an installation-specific development CA in your operating-system
+              credential store. This does not install or trust the certificate, change
+              system proxy settings, or enable HTTPS interception.
+            </p>
+            {caStatus?.state === "ready" ? (
+              <div className="ca-panel">
+                <dl>
+                  <dt>State</dt>
+                  <dd>Generated locally · not installed by Sippin Soda</dd>
+                  <dt>SHA-256 fingerprint</dt>
+                  <dd className="fingerprint">{caStatus.fingerprintSha256}</dd>
+                  <dt>Created</dt>
+                  <dd>
+                    {caStatus.createdAt
+                      ? new Date(caStatus.createdAt).toLocaleString()
+                      : "Unavailable"}
+                  </dd>
+                  <dt>Expires</dt>
+                  <dd>
+                    {caStatus.expiresAt
+                      ? new Date(caStatus.expiresAt).toLocaleString()
+                      : "Unavailable"}
+                  </dd>
+                </dl>
+                <button disabled={caBusy} onClick={() => void exportCa()}>
+                  Export public certificate
+                </button>
+                <label className="danger-confirmation">
+                  <input
+                    type="checkbox"
+                    checked={caRemoveConfirmed}
+                    disabled={caBusy}
+                    onChange={(event) =>
+                      setCaRemoveConfirmed(event.target.checked)
+                    }
+                  />{" "}
+                  Remove the private key and certificate from credential storage.
+                </label>
+                <button
+                  disabled={caBusy || !caRemoveConfirmed}
+                  onClick={() =>
+                    void caCommand("remove_local_ca", { confirmed: true })
+                  }
+                >
+                  Remove local CA material
+                </button>
+              </div>
+            ) : (
+              <div className="ca-panel">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={caConsent}
+                    disabled={!desktop || caBusy}
+                    onChange={(event) => setCaConsent(event.target.checked)}
+                  />{" "}
+                  I consent to generating a local CA private key in my operating-system
+                  credential store. Nothing will be installed into a trust store.
+                </label>
+                <button
+                  disabled={!desktop || caBusy || !caConsent}
+                  onClick={() =>
+                    void caCommand("generate_local_ca", { consent: true })
+                  }
+                >
+                  {caBusy ? "Generating…" : "Generate local CA"}
+                </button>
+              </div>
+            )}
+            {caMessage && <p role="status">{caMessage}</p>}
           </div>
         ) : (
           <div className="planned-panel">

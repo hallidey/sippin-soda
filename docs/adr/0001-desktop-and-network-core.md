@@ -19,7 +19,7 @@ Sippin Soda needs an independent network engine, a local desktop UI, bounded res
 
 Use React + TypeScript in a Tauri 2 shell. Put engine contracts and policies in `crates/engine` with no UI dependency. Use Rust provisionally to avoid introducing an FFI boundary before there is evidence it is needed. Do not add a hosted API or cloud store.
 
-The HTTP spike now uses Tokio + Hyper in the independent engine crate. It has an explicit loopback listener, streaming forwarding, bounded metadata capture and cancellation. Local integration fixtures verify real transfers, failure paths and lifecycle. Effective HTTP and CONNECT target hosts are classified with validated Development/Production rules; unlisted hosts remain Unknown and active-operation authorization fails closed. No CA or system proxy setting is changed. TLS interception, session persistence and full redaction remain unimplemented.
+The HTTP spike now uses Tokio + Hyper in the independent engine crate. It has an explicit loopback listener, streaming forwarding, bounded metadata capture and cancellation. Local integration fixtures verify real transfers, failure paths and lifecycle. Effective HTTP and CONNECT target hosts are classified with validated Development/Production rules; unlisted hosts remain Unknown and active-operation authorization fails closed. A consent-based local CA can be generated into operating-system credential storage and its public certificate exported, but the app does not install it or intercept TLS. TLS leaf issuance/interception, session persistence and full redaction remain unimplemented.
 
 ## Required validation before accepting the network decision
 
