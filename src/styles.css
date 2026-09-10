@@ -658,6 +658,16 @@ input:focus-visible {
 .body-options input[type="number"] {
   width: 100px;
 }
+.body-options .redaction-paths {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.body-options textarea {
+  box-sizing: border-box;
+  width: min(560px, 100%);
+  resize: vertical;
+  font-family: Consolas, monospace;
+}
 .body-toolbar input:not([type="checkbox"]) {
   width: 150px;
 }

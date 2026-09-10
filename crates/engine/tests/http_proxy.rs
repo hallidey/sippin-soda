@@ -284,6 +284,81 @@ async fn forwards_post_body_without_recording_it() {
 }
 
 #[tokio::test]
+async fn forwards_original_json_but_persists_only_the_redacted_request_copy() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap().port();
+    let original = r#"{"email":"dev@example.test","password":"secret","nested":{"access_token":"abc","count":3}}"#;
+    let expected = original.as_bytes().to_vec();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut headers = vec![];
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+        }
+        let mut payload = vec![0; expected.len()];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, expected);
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let engine = ProxyEngine::default();
+    let status = engine
+        .start(ProxyConfig {
+            port: 0,
+            capture_bodies: true,
+            body_disk_budget: 1024 * 1024,
+            request_redaction_paths: vec!["/email".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        status.status.listen_address.port(),
+        format!(
+            "POST http://127.0.0.1:{upstream}/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{original}",
+            original.len()
+        ),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 204"));
+    upstream_task.await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while engine.snapshot().traffic[0].request_body_state == "recording" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let capture = &engine.snapshot().traffic[0];
+    assert_eq!(capture.request_body_state, "complete");
+    assert_eq!(capture.request_body_error, None);
+    let page = engine.request_body_page(1, 0, 65536).await.unwrap();
+    let redacted: serde_json::Value = serde_json::from_slice(&page.bytes).unwrap();
+    assert_eq!(redacted["email"], "[REDACTED]");
+    assert_eq!(redacted["password"], "[REDACTED]");
+    assert_eq!(redacted["nested"]["access_token"], "[REDACTED]");
+    assert_eq!(redacted["nested"]["count"], 3);
+    assert!(!String::from_utf8(page.bytes).unwrap().contains("secret"));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_custom_redaction_path_is_rejected_before_listening() {
+    let engine = ProxyEngine::default();
+    assert!(engine
+        .start(ProxyConfig {
+            port: 0,
+            request_redaction_paths: vec!["profile/email".into()],
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert_eq!(engine.snapshot().status.phase, EnginePhase::Stopped);
+}
+
+#[tokio::test]
 async fn response_bytes_arrive_before_upstream_finishes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = listener.local_addr().unwrap().port();

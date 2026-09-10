@@ -67,6 +67,16 @@ function App() {
   const [port, setPort] = useState("8080");
   const [captureBodies, setCaptureBodies] = useState(false);
   const [diskBudget, setDiskBudget] = useState("10");
+  const [redactionPaths, setRedactionPaths] = useState("");
+  const parsedRedactionPaths = redactionPaths
+    .split(/[\n,]/)
+    .map((path) => path.trim())
+    .filter(Boolean);
+  const validRedactionPaths =
+    parsedRedactionPaths.length <= 64 &&
+    parsedRedactionPaths.every(
+      (path) => path.startsWith("/") && path.length <= 512,
+    );
   const validBudget =
     /^\d+$/.test(diskBudget) &&
     Number(diskBudget) >= 1 &&
@@ -160,7 +170,8 @@ function App() {
                   !desktop ||
                   !status ||
                   busy ||
-                  (!running && (!validPort || !validBudget))
+                  (!running &&
+                    (!validPort || !validBudget || !validRedactionPaths))
                 }
                 onClick={() =>
                   void command(
@@ -171,6 +182,7 @@ function App() {
                           port: Number(port),
                           captureBodies,
                           diskBudgetGib: Number(diskBudget),
+                          requestRedactionPaths: parsedRedactionPaths,
                         },
                   )
                 }
@@ -195,7 +207,7 @@ function App() {
                   disabled={running || busy || !desktop}
                   onChange={(event) => setCaptureBodies(event.target.checked)}
                 />{" "}
-                Record HTTP response bodies
+                Record HTTP bodies
               </label>
               <label>
                 Session disk budget (GiB){" "}
@@ -208,11 +220,31 @@ function App() {
                   onChange={(event) => setDiskBudget(event.target.value)}
                 />
               </label>
+              <label className="redaction-paths">
+                Additional JSON Pointer redactions
+                <textarea
+                  rows={3}
+                  value={redactionPaths}
+                  disabled={running || busy || !desktop}
+                  aria-invalid={!validRedactionPaths}
+                  placeholder={"/customer/email\n/items/*/cardNumber"}
+                  onChange={(event) => setRedactionPaths(event.target.value)}
+                />
+              </label>
+              {!validRedactionPaths && (
+                <p className="error" role="alert">
+                  Use at most 64 JSON Pointers, each beginning with / and no
+                  longer than 512 characters.
+                </p>
+              )}
               <p>
-                No per-response size cap. Bodies are stored in temporary local
-                files and read in 64 KiB pages. Raw body content is not redacted
-                or encrypted at rest and may contain secrets. Clear, eviction
-                and normal app exit remove files; Stop keeps them available.
+                Responses have no per-body size cap and remain unredacted.
+                JSON requests up to 1 MiB are redacted before temporary-disk
+                storage; built-in secret keys are always protected and these
+                additional paths support * for array/object members. Other
+                request formats are not recorded. Body files are read in 64 KiB
+                pages and are not encrypted at rest. Clear, eviction and normal
+                app exit remove them; Stop keeps them available.
               </p>
             </div>
             <Traffic

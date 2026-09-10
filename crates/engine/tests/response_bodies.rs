@@ -11,7 +11,7 @@ async fn start(budget: u64) -> (ProxyEngine, u16) {
     let port = engine
         .start(ProxyConfig {
             port: 0,
-            capture_response_bodies: true,
+            capture_bodies: true,
             body_disk_budget: budget,
             ..Default::default()
         })
@@ -209,7 +209,7 @@ async fn long_response_outlives_header_timeout_and_can_be_read_while_streaming()
     let port = engine
         .start(ProxyConfig {
             port: 0,
-            capture_response_bodies: true,
+            capture_bodies: true,
             request_timeout: Duration::from_millis(100),
             ..Default::default()
         })
