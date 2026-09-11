@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{
     rustls::{
         pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
@@ -220,7 +220,7 @@ where
     let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
     let verified_upstream =
         TlsConnector::from(Arc::new(client_config)).connect(upstream_name, upstream);
-    let (mut downstream, mut verified_upstream) = tokio::time::timeout(handshake_timeout, async {
+    let (downstream, verified_upstream) = tokio::time::timeout(handshake_timeout, async {
         let upstream = verified_upstream
             .await
             .map_err(|_| TlsInterceptError::UpstreamVerification)?;
@@ -231,17 +231,42 @@ where
     })
     .await
     .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
-    let (client_to_upstream_bytes, upstream_to_client_bytes) = tokio::time::timeout(
-        lifetime,
-        tokio::io::copy_bidirectional(&mut downstream, &mut verified_upstream),
-    )
-    .await
-    .map_err(|_| TlsInterceptError::LifetimeExceeded)?
-    .map_err(|_| TlsInterceptError::Transport)?;
+    let (downstream_reader, downstream_writer) = tokio::io::split(downstream);
+    let (upstream_reader, upstream_writer) = tokio::io::split(verified_upstream);
+    let transfer = async {
+        tokio::try_join!(
+            copy_with_flush(downstream_reader, upstream_writer),
+            copy_with_flush(upstream_reader, downstream_writer),
+        )
+    };
+    let (client_to_upstream_bytes, upstream_to_client_bytes) =
+        tokio::time::timeout(lifetime, transfer)
+            .await
+            .map_err(|_| TlsInterceptError::LifetimeExceeded)?
+            .map_err(|_| TlsInterceptError::Transport)?;
     Ok(TlsBridgeResult {
         client_to_upstream_bytes,
         upstream_to_client_bytes,
     })
+}
+
+async fn copy_with_flush<R, W>(mut reader: R, mut writer: W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut transferred = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            writer.shutdown().await?;
+            return Ok(transferred);
+        }
+        writer.write_all(&buffer[..count]).await?;
+        writer.flush().await?;
+        transferred += count as u64;
+    }
 }
 
 #[cfg(test)]
@@ -391,7 +416,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridges_plaintext_only_when_both_tls_peers_are_verified() {
+    async fn bridges_large_persistent_round_trip_only_when_both_tls_peers_are_verified() {
+        const REQUEST_BYTES: usize = 128 * 1024;
         let (identity, upstream_config) = upstream_tls();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -401,10 +427,13 @@ mod tests {
                 .accept(socket)
                 .await
                 .unwrap();
-            let mut request = [0; 7];
+            let mut request = vec![0; REQUEST_BYTES];
             tls.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"inspect");
+            assert!(request.iter().all(|byte| *byte == 0x5a));
             tls.write_all(b"verified").await.unwrap();
+            tls.flush().await.unwrap();
+            let mut remainder = Vec::new();
+            tls.read_to_end(&mut remainder).await.unwrap();
             tls.shutdown().await.unwrap();
         });
         let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("client.dev.test");
@@ -424,13 +453,14 @@ mod tests {
         let mut client = downstream_client(client_side, ca_pem.as_bytes())
             .await
             .unwrap();
-        client.write_all(b"inspect").await.unwrap();
+        client.write_all(&vec![0x5a; REQUEST_BYTES]).await.unwrap();
+        client.flush().await.unwrap();
+        let mut response = [0; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"verified");
         client.shutdown().await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        assert_eq!(response, b"verified");
         let result = bridge.await.unwrap().unwrap();
-        assert_eq!(result.client_to_upstream_bytes, 7);
+        assert_eq!(result.client_to_upstream_bytes, REQUEST_BYTES as u64);
         assert_eq!(result.upstream_to_client_bytes, 8);
         upstream_server.await.unwrap();
     }
@@ -483,5 +513,293 @@ mod tests {
     #[tokio::test]
     async fn rejects_an_upstream_certificate_for_a_different_host() {
         assert_upstream_rejected(true, "other.dev.test").await;
+    }
+
+    #[derive(Clone)]
+    struct BenchmarkIdentity {
+        certificate: CertificateDer<'static>,
+        private_key: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct BenchmarkConfig {
+        payload_bytes: usize,
+        samples: usize,
+        concurrency: usize,
+    }
+
+    struct BenchmarkModeResult {
+        wall_time: Duration,
+        samples: Vec<Duration>,
+        peak_memory_bytes: u64,
+    }
+
+    fn benchmark_setting(name: &str, default: usize, min: usize, max: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| (*value >= min) && (*value <= max))
+            .unwrap_or(default)
+    }
+
+    fn benchmark_config() -> BenchmarkConfig {
+        BenchmarkConfig {
+            payload_bytes: benchmark_setting("SIPPIN_BENCH_PAYLOAD_MIB", 1, 1, 64) * 1024 * 1024,
+            samples: benchmark_setting("SIPPIN_BENCH_SAMPLES", 20, 3, 500),
+            concurrency: benchmark_setting("SIPPIN_BENCH_CONCURRENCY", 4, 1, 64),
+        }
+    }
+
+    fn benchmark_identity(host: &str) -> BenchmarkIdentity {
+        let identity = rcgen::generate_simple_self_signed(vec![host.into()]).unwrap();
+        BenchmarkIdentity {
+            certificate: identity.cert.der().clone(),
+            private_key: identity.signing_key.serialize_der(),
+        }
+    }
+
+    async fn echo_server(
+        listener: TcpListener,
+        tls: Option<Arc<ServerConfig>>,
+        payload_bytes: usize,
+    ) {
+        let (socket, _) = listener.accept().await.unwrap();
+        if let Some(tls) = tls {
+            let mut stream = TlsAcceptor::from(tls).accept(socket).await.unwrap();
+            let mut payload = vec![0; payload_bytes];
+            stream.read_exact(&mut payload).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+        } else {
+            let mut stream = socket;
+            let mut payload = vec![0; payload_bytes];
+            stream.read_exact(&mut payload).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    }
+
+    async fn pass_through_sample(payload: Arc<Vec<u8>>) -> Duration {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(echo_server(listener, None, payload.len()));
+        let mut upstream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut tunnel, mut client) = tokio::io::duplex(payload.len().max(16 * 1024));
+        let proxy = tokio::spawn(async move {
+            tokio::io::copy_bidirectional(&mut tunnel, &mut upstream)
+                .await
+                .unwrap()
+        });
+        let started = std::time::Instant::now();
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        let mut echoed = vec![0; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(echoed, *payload);
+        drop(client);
+        proxy.abort();
+        server.abort();
+        let _ = proxy.await;
+        let _ = server.await;
+        elapsed
+    }
+
+    async fn tls_sample(
+        payload: Arc<Vec<u8>>,
+        upstream_identity: BenchmarkIdentity,
+        downstream_identity: BenchmarkIdentity,
+    ) -> Duration {
+        let upstream_server = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![upstream_identity.certificate.clone()],
+                PrivatePkcs8KeyDer::from(upstream_identity.private_key.clone()).into(),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(echo_server(
+            listener,
+            Some(Arc::new(upstream_server)),
+            payload.len(),
+        ));
+        let upstream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (bridge_side, client_side) = tokio::io::duplex(payload.len().max(16 * 1024));
+        let mut upstream_roots = RootCertStore::empty();
+        upstream_roots
+            .add(upstream_identity.certificate.clone())
+            .unwrap();
+        let leaf = IssuedLeaf {
+            certificate_der: downstream_identity.certificate.to_vec(),
+            private_key_der: zeroize::Zeroizing::new(downstream_identity.private_key.clone()),
+            issuer_fingerprint_sha256: "benchmark-only".into(),
+            host: "client.dev.test".into(),
+            expires_at: u64::MAX,
+        };
+        let bridge = tokio::spawn(bridge_verified_tls(
+            bridge_side,
+            upstream,
+            "upstream.dev.test",
+            leaf,
+            upstream_roots,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        ));
+        let mut downstream_roots = RootCertStore::empty();
+        downstream_roots
+            .add(downstream_identity.certificate.clone())
+            .unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(downstream_roots)
+                .with_no_client_auth(),
+        ));
+        let started = std::time::Instant::now();
+        let mut client = connector
+            .connect(
+                ServerName::try_from("client.dev.test".to_string()).unwrap(),
+                client_side,
+            )
+            .await
+            .unwrap();
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        let mut echoed = vec![0; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(echoed, *payload);
+        drop(client);
+        bridge.abort();
+        server.abort();
+        let _ = bridge.await;
+        let _ = server.await;
+        elapsed
+    }
+
+    async fn measure_mode<F, Fut>(config: BenchmarkConfig, sample: F) -> BenchmarkModeResult
+    where
+        F: Fn() -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Duration> + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        for _ in 0..2 {
+            sample().await;
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let sampler_stopped = stopped.clone();
+        let sampler_peak = peak.clone();
+        let sampler = tokio::spawn(async move {
+            let pid = get_current_pid().unwrap();
+            let mut system = System::new();
+            while !sampler_stopped.load(Ordering::Relaxed) {
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    ProcessRefreshKind::nothing().with_memory(),
+                );
+                if let Some(process) = system.process(pid) {
+                    sampler_peak.fetch_max(process.memory(), Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let wall_started = std::time::Instant::now();
+        let mut durations = Vec::with_capacity(config.samples);
+        let mut completed = 0;
+        while completed < config.samples {
+            let batch = (config.samples - completed).min(config.concurrency);
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..batch {
+                let sample = sample.clone();
+                tasks.spawn(sample());
+            }
+            while let Some(result) = tasks.join_next().await {
+                durations.push(result.unwrap());
+            }
+            completed += batch;
+        }
+        let wall_time = wall_started.elapsed();
+        stopped.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+        BenchmarkModeResult {
+            wall_time,
+            samples: durations,
+            peak_memory_bytes: peak.load(Ordering::Relaxed),
+        }
+    }
+
+    fn percentile(samples: &[Duration], percentile: usize) -> f64 {
+        let mut micros = samples
+            .iter()
+            .map(|sample| sample.as_secs_f64() * 1_000_000.0)
+            .collect::<Vec<_>>();
+        micros.sort_by(f64::total_cmp);
+        let rank = (micros.len() * percentile).div_ceil(100);
+        micros[rank.saturating_sub(1).min(micros.len() - 1)]
+    }
+
+    fn benchmark_report(
+        config: BenchmarkConfig,
+        result: &BenchmarkModeResult,
+    ) -> serde_json::Value {
+        let transferred = (config.payload_bytes as f64) * (config.samples as f64) * 2.0;
+        serde_json::json!({
+            "wallMs": result.wall_time.as_secs_f64() * 1000.0,
+            "p50Micros": percentile(&result.samples, 50),
+            "p95Micros": percentile(&result.samples, 95),
+            "throughputMiBPerSecond": transferred / result.wall_time.as_secs_f64() / 1024.0 / 1024.0,
+            "peakProcessMiB": result.peak_memory_bytes as f64 / 1024.0 / 1024.0,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "run explicitly with npm run benchmark:tls"]
+    async fn tls_transport_benchmark() {
+        let config = benchmark_config();
+        let payload = Arc::new(vec![0x5a; config.payload_bytes]);
+        let pass_payload = payload.clone();
+        let pass_through = measure_mode(config, move || {
+            let payload = pass_payload.clone();
+            async move { pass_through_sample(payload).await }
+        })
+        .await;
+        let upstream_identity = benchmark_identity("upstream.dev.test");
+        let downstream_identity = benchmark_identity("client.dev.test");
+        let tls = measure_mode(config, move || {
+            let payload = payload.clone();
+            let upstream = upstream_identity.clone();
+            let downstream = downstream_identity.clone();
+            async move { tls_sample(payload, upstream, downstream).await }
+        })
+        .await;
+        let mut system = sysinfo::System::new_all();
+        system.refresh_cpu_all();
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "hardware": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "logicalCpus": std::thread::available_parallelism().map(usize::from).unwrap_or(1),
+                "cpu": system.cpus().first().map(|cpu| cpu.brand()).unwrap_or("unknown"),
+                "totalMemoryMiB": system.total_memory() as f64 / 1024.0 / 1024.0,
+            },
+            "workload": {
+                "payloadBytesEachDirection": config.payload_bytes,
+                "samples": config.samples,
+                "concurrency": config.concurrency,
+                "tlsIncludesHandshake": true,
+                "connectionTeardownIncluded": false,
+            },
+            "passThrough": benchmark_report(config, &pass_through),
+            "verifiedTlsBridge": benchmark_report(config, &tls),
+            "tlsP50OverheadPercent": (percentile(&tls.samples, 50) / percentile(&pass_through.samples, 50) - 1.0) * 100.0,
+        });
+        println!("SIPPIN_TLS_BENCHMARK={report}");
     }
 }
