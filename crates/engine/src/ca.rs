@@ -1,6 +1,8 @@
+use crate::{authorize, Action, DestinationClass};
 use keyring::{Entry, Error as KeyringError};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +47,15 @@ struct StoredCa {
     fingerprint_sha256: String,
     created_at: u64,
     expires_at: u64,
+}
+
+pub struct IssuedLeaf {
+    pub certificate_der: Vec<u8>,
+    // Reserved for the engine's TLS terminator; never exposed through the public API or IPC.
+    #[allow(dead_code)]
+    pub(crate) private_key_der: Zeroizing<Vec<u8>>,
+    pub host: String,
+    pub expires_at: u64,
 }
 
 pub struct CaManager {
@@ -136,6 +147,23 @@ impl CaManager {
             Err(_) => Err("Cannot remove the local CA from the credential store.".into()),
         }
     }
+
+    pub fn issue_leaf(
+        &self,
+        host: &str,
+        destination: DestinationClass,
+    ) -> Result<IssuedLeaf, String> {
+        authorize(destination, Action::InspectTls)
+            .map_err(|_| "TLS certificates can be issued only for Development destinations.")?;
+        let _guard = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "Local CA lifecycle lock failed.")?;
+        let ca = self
+            .load()?
+            .ok_or("Generate the local CA before issuing a host certificate.")?;
+        issue_leaf_from_ca(&ca, host, destination)
+    }
 }
 
 fn status_from(ca: &StoredCa) -> CaStatus {
@@ -188,9 +216,92 @@ fn generate_ca() -> Result<StoredCa, String> {
     })
 }
 
+fn issue_leaf_from_ca(
+    ca: &StoredCa,
+    host: &str,
+    destination: DestinationClass,
+) -> Result<IssuedLeaf, String> {
+    authorize(destination, Action::InspectTls)
+        .map_err(|_| "TLS certificates can be issued only for Development destinations.")?;
+    let host = normalize_leaf_host(host)?;
+    let ca_key = KeyPair::from_pem(&ca.private_key_pem)
+        .map_err(|_| "The stored local CA private key is invalid.")?;
+    let issuer = Issuer::from_ca_cert_pem(&ca.certificate_pem, ca_key)
+        .map_err(|_| "The stored local CA certificate is invalid.")?;
+    let now = OffsetDateTime::now_utc();
+    let ca_expiry = OffsetDateTime::from_unix_timestamp((ca.expires_at / 1000) as i64)
+        .map_err(|_| "The stored local CA expiry is invalid.")?;
+    let expires = std::cmp::min(now + Duration::hours(24), ca_expiry);
+    if expires <= now {
+        return Err("The local CA has expired; remove and regenerate it.".into());
+    }
+    let mut params = CertificateParams::new(vec![host.clone()])
+        .map_err(|_| "Cannot initialize host certificate parameters.")?;
+    let mut name = DistinguishedName::new();
+    name.push(DnType::OrganizationName, "Sippin Soda local development");
+    name.push(DnType::CommonName, host.clone());
+    params.distinguished_name = name;
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = now - Duration::minutes(5);
+    params.not_after = expires;
+    let leaf_key = KeyPair::generate().map_err(|_| "Cannot generate the host private key.")?;
+    let certificate = params
+        .signed_by(&leaf_key, &issuer)
+        .map_err(|_| "Cannot sign the host certificate with the local CA.")?;
+    Ok(IssuedLeaf {
+        certificate_der: certificate.der().to_vec(),
+        private_key_der: Zeroizing::new(leaf_key.serialize_der()),
+        host,
+        expires_at: (expires.unix_timestamp() as u64) * 1000,
+    })
+}
+
+fn normalize_leaf_host(host: &str) -> Result<String, String> {
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let valid_name = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    });
+    if host.is_empty()
+        || host.len() > 253
+        || !host.is_ascii()
+        || (host.parse::<std::net::IpAddr>().is_err() && !valid_name)
+    {
+        return Err(
+            "Host certificates require a valid DNS name or IP address without a port.".into(),
+        );
+    }
+    Ok(host)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{generate_ca, CaManager};
+    use super::{generate_ca, issue_leaf_from_ca, CaManager, IssuedLeaf, StoredCa};
+    use crate::DestinationClass;
+    use std::{io::Cursor, sync::Arc};
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_rustls::{
+        rustls::{
+            pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
+            ClientConfig, RootCertStore, ServerConfig,
+        },
+        TlsAcceptor, TlsConnector,
+    };
 
     #[test]
     fn generated_ca_has_public_certificate_private_key_and_stable_metadata() {
@@ -208,5 +319,70 @@ mod tests {
         let manager = CaManager::default();
         assert!(manager.generate(false).is_err());
         assert!(manager.remove(false).is_err());
+    }
+
+    #[test]
+    fn leaf_issuance_is_development_only_and_host_scoped() {
+        let ca = generate_ca().unwrap();
+        let leaf = issue_leaf_from_ca(&ca, "API.Dev.Test.", DestinationClass::Development).unwrap();
+        assert_eq!(leaf.host, "api.dev.test");
+        assert!(!leaf.certificate_der.is_empty());
+        assert!(!leaf.private_key_der.is_empty());
+        assert!(leaf.expires_at > ca.created_at);
+        assert!(issue_leaf_from_ca(&ca, "api.test", DestinationClass::Production).is_err());
+        assert!(issue_leaf_from_ca(&ca, "api.test", DestinationClass::Unknown).is_err());
+        assert!(
+            issue_leaf_from_ca(&ca, "https://api.test", DestinationClass::Development).is_err()
+        );
+        assert!(issue_leaf_from_ca(&ca, "*.dev.test", DestinationClass::Development).is_err());
+    }
+
+    async fn tls_handshake_succeeds(ca: &StoredCa, leaf: IssuedLeaf, server_name: &str) -> bool {
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(leaf.certificate_der)],
+                PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(Arc::new(server_config))
+                .accept(stream)
+                .await
+        });
+
+        let mut roots = RootCertStore::empty();
+        let ca_der = rustls_pemfile::certs(&mut Cursor::new(ca.certificate_pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        roots.add(ca_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let name = ServerName::try_from(server_name.to_owned()).unwrap();
+        let client_result = timeout(
+            std::time::Duration::from_secs(2),
+            TlsConnector::from(Arc::new(client_config)).connect(name, stream),
+        )
+        .await;
+        let _ = server.await;
+        matches!(client_result, Ok(Ok(_)))
+    }
+
+    #[tokio::test]
+    async fn issued_leaf_is_trusted_only_for_its_subject_alt_name() {
+        let ca = generate_ca().unwrap();
+        let matching =
+            issue_leaf_from_ca(&ca, "api.dev.test", DestinationClass::Development).unwrap();
+        assert!(tls_handshake_succeeds(&ca, matching, "api.dev.test").await);
+
+        let mismatching =
+            issue_leaf_from_ca(&ca, "api.dev.test", DestinationClass::Development).unwrap();
+        assert!(!tls_handshake_succeeds(&ca, mismatching, "other.dev.test").await);
     }
 }
