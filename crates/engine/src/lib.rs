@@ -1,10 +1,12 @@
 //! UI-independent network engine and development policies.
 mod ca;
 mod proxy;
+mod tls_intercept;
 pub use ca::*;
 pub use proxy::*;
 use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+pub use tls_intercept::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
