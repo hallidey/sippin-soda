@@ -53,6 +53,7 @@ pub struct IssuedLeaf {
     pub certificate_der: Vec<u8>,
     // Consumed only by the engine's TLS terminator; never exposed through IPC.
     pub(crate) private_key_der: Zeroizing<Vec<u8>>,
+    pub(crate) issuer_fingerprint_sha256: String,
     pub host: String,
     pub expires_at: u64,
 }
@@ -71,11 +72,12 @@ impl Default for CaManager {
 
 impl CaManager {
     #[cfg(test)]
-    pub(crate) fn ephemeral_leaf_for_test(host: &str) -> (String, IssuedLeaf) {
+    pub(crate) fn ephemeral_leaf_for_test(host: &str) -> (String, IssuedLeaf, CaStatus) {
         let ca = generate_ca().unwrap();
         let certificate = ca.certificate_pem.clone();
         let leaf = issue_leaf_from_ca(&ca, host, DestinationClass::Development).unwrap();
-        (certificate, leaf)
+        let status = status_from(&ca);
+        (certificate, leaf, status)
     }
 
     fn entry(&self) -> Result<Entry, String> {
@@ -263,6 +265,7 @@ fn issue_leaf_from_ca(
     Ok(IssuedLeaf {
         certificate_der: certificate.der().to_vec(),
         private_key_der: Zeroizing::new(leaf_key.serialize_der()),
+        issuer_fingerprint_sha256: ca.fingerprint_sha256.clone(),
         host,
         expires_at: (expires.unix_timestamp() as u64) * 1000,
     })
