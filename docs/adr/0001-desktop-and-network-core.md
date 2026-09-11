@@ -1,6 +1,6 @@
 # ADR 0001: desktop shell and network core
 
-Status: provisional. Rust is selected for the foundation; the network decision must be revisited after the HTTP/TLS spike. No comparative benchmark has been run yet.
+Status: provisional. Rust is selected for the foundation; the network decision must be revisited after the HTTP/TLS spike. A reproducible Rust pass-through/TLS baseline now exists, but cross-platform repetitions and a comparable C++ run remain outstanding.
 
 ## Context
 
@@ -25,7 +25,7 @@ The HTTP spike now uses Tokio + Hyper in the independent engine crate. It has an
 
 1. HTTP spike implemented: local upstream fixtures, streaming byte forwarding and cancellation. Desktop Start/Stop, native IPC events and real 200/500/slow captures verified on Windows. This is functional evidence, not a performance benchmark.
 2. Test CONNECT pass-through separately from TLS interception; validate upstream trust and failure behavior.
-3. Record hardware, concurrency, payload size, throughput, p50/p95 overhead and peak memory.
+3. Record hardware, concurrency, payload size, throughput, p50/p95 overhead and peak memory. The harness and initial Windows baseline are documented in [TLS transport benchmark](../benchmarks/TLS_TRANSPORT.md); repeat runs and other platforms remain pending.
 4. Evaluate Hyper/Rustls limitations against the protocol roadmap and compare a C++ alternative where gaps matter.
 5. Decide library vs sidecar isolation, crash recovery and IPC backpressure in a follow-up ADR.
 

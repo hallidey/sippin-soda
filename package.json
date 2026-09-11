@@ -11,6 +11,7 @@
     "tauri": "node scripts/with-rust.mjs tauri",
     "desktop": "node scripts/with-rust.mjs tauri dev",
     "test:engine": "node scripts/with-rust.mjs cargo test -p sippin-soda-engine",
+    "benchmark:tls": "node scripts/with-rust.mjs cargo test --release -p sippin-soda-engine tls_transport_benchmark -- --ignored --nocapture --test-threads=1",
     "fixture": "node examples/http-fixture.mjs"
   },
   "dependencies": {
