@@ -51,8 +51,7 @@ struct StoredCa {
 
 pub struct IssuedLeaf {
     pub certificate_der: Vec<u8>,
-    // Reserved for the engine's TLS terminator; never exposed through the public API or IPC.
-    #[allow(dead_code)]
+    // Consumed only by the engine's TLS terminator; never exposed through IPC.
     pub(crate) private_key_der: Zeroizing<Vec<u8>>,
     pub host: String,
     pub expires_at: u64,
@@ -71,6 +70,14 @@ impl Default for CaManager {
 }
 
 impl CaManager {
+    #[cfg(test)]
+    pub(crate) fn ephemeral_leaf_for_test(host: &str) -> (String, IssuedLeaf) {
+        let ca = generate_ca().unwrap();
+        let certificate = ca.certificate_pem.clone();
+        let leaf = issue_leaf_from_ca(&ca, host, DestinationClass::Development).unwrap();
+        (certificate, leaf)
+    }
+
     fn entry(&self) -> Result<Entry, String> {
         Entry::new(SERVICE, ACCOUNT)
             .map_err(|_| "The operating-system credential store is unavailable.".into())
