@@ -26,11 +26,36 @@ type CaStatus = {
 };
 type TlsTrustCheckStatus = {
   state: "idle" | "waiting" | "verified" | "failed" | "expired";
+  client: TlsClientProfile | null;
   url: string | null;
   expiresAt: number | null;
   verifiedAt: number | null;
   error: string | null;
 };
+type TlsClientProfile = {
+  id: string;
+  name: string;
+};
+
+const clientProfilesKey = "sippin-tls-client-profiles";
+
+function loadClientProfiles(): TlsClientProfile[] {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(clientProfilesKey) ?? "[]",
+    );
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (profile): profile is TlsClientProfile =>
+        typeof profile === "object" &&
+        profile !== null &&
+        typeof (profile as TlsClientProfile).id === "string" &&
+        typeof (profile as TlsClientProfile).name === "string",
+    );
+  } catch {
+    return [];
+  }
+}
 const descriptions: Record<Section, string> = {
   Traffic: "Your application’s traffic, in one place.",
   Collections: "Compose requests and keep repeatable workflows together.",
@@ -96,6 +121,13 @@ function App() {
   );
   const [trustCheckConsent, setTrustCheckConsent] = useState(false);
   const [trustCheckBusy, setTrustCheckBusy] = useState(false);
+  const [clientProfiles, setClientProfiles] = useState(loadClientProfiles);
+  const [selectedClientId, setSelectedClientId] = useState(
+    () => loadClientProfiles()[0]?.id ?? "",
+  );
+  const [newClientName, setNewClientName] = useState("");
+  const selectedClient =
+    clientProfiles.find((profile) => profile.id === selectedClientId) ?? null;
   const parseHostRules = (value: string) =>
     value
       .split(/[\n,]/)
@@ -134,6 +166,15 @@ function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("sippin-theme", theme);
   }, [theme]);
+  useEffect(() => {
+    localStorage.setItem(clientProfilesKey, JSON.stringify(clientProfiles));
+    if (
+      selectedClientId &&
+      !clientProfiles.some((profile) => profile.id === selectedClientId)
+    ) {
+      setSelectedClientId(clientProfiles[0]?.id ?? "");
+    }
+  }, [clientProfiles, selectedClientId]);
   useEffect(() => {
     if (!desktop) return;
     let active = true;
@@ -193,7 +234,18 @@ function App() {
     setTrustCheckBusy(true);
     setCaMessage("");
     try {
-      const next = await invoke<TlsTrustCheckStatus>(name);
+      if (name === "start_tls_trust_check" && !selectedClient) {
+        throw new Error("Choose a client profile before starting the check.");
+      }
+      const next = await invoke<TlsTrustCheckStatus>(
+        name,
+        name === "start_tls_trust_check"
+          ? {
+              clientId: selectedClient!.id,
+              clientName: selectedClient!.name,
+            }
+          : undefined,
+      );
       setTrustCheck(next);
       setTrustCheckConsent(false);
     } catch (cause) {
@@ -201,6 +253,23 @@ function App() {
     } finally {
       setTrustCheckBusy(false);
     }
+  };
+  const addClientProfile = () => {
+    const name = newClientName.trim();
+    if (!name || name.length > 80) return;
+    const profile = { id: crypto.randomUUID(), name };
+    setClientProfiles((current) => [...current, profile]);
+    setSelectedClientId(profile.id);
+    setNewClientName("");
+  };
+  const removeSelectedClient = () => {
+    if (!selectedClient) return;
+    if (trustCheck?.client?.id === selectedClient.id) {
+      void trustCheckCommand("cancel_tls_trust_check");
+    }
+    setClientProfiles((current) =>
+      current.filter((profile) => profile.id !== selectedClient.id),
+    );
   };
   const copyTrustCheckUrl = async () => {
     if (!trustCheck?.url) return;
@@ -519,8 +588,73 @@ function App() {
                     browser or runtime that will use the proxy. This verifies
                     only that client and does not enable HTTPS inspection.
                   </p>
+                  <div className="client-profile-editor">
+                    <label htmlFor="tls-client-profile">Client profile</label>
+                    <div className="trust-check-actions">
+                      <select
+                        id="tls-client-profile"
+                        value={selectedClientId}
+                        disabled={
+                          trustCheck?.state === "waiting" || trustCheckBusy
+                        }
+                        onChange={(event) =>
+                          setSelectedClientId(event.target.value)
+                        }
+                      >
+                        <option value="">Choose a configured client</option>
+                        {clientProfiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>
+                            {profile.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        disabled={
+                          !selectedClient ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
+                        }
+                        onClick={removeSelectedClient}
+                      >
+                        Remove profile
+                      </button>
+                    </div>
+                    <div className="trust-check-actions">
+                      <input
+                        value={newClientName}
+                        maxLength={80}
+                        disabled={
+                          trustCheck?.state === "waiting" || trustCheckBusy
+                        }
+                        aria-label="New client profile name"
+                        placeholder="Chrome development profile"
+                        onChange={(event) =>
+                          setNewClientName(event.target.value)
+                        }
+                      />
+                      <button
+                        disabled={
+                          !newClientName.trim() ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
+                        }
+                        onClick={addClientProfile}
+                      >
+                        Add profile
+                      </button>
+                    </div>
+                    <p className="muted">
+                      The profile records your chosen browser or runtime; it
+                      does not identify a process automatically. A trust proof
+                      cannot be reused for a different profile.
+                    </p>
+                  </div>
                   {trustCheck?.state === "waiting" ? (
                     <>
+                      <p role="status">
+                        Waiting for{" "}
+                        {trustCheck.client?.name ?? "selected client"}.
+                      </p>
                       <code className="trust-check-url">{trustCheck.url}</code>
                       <p>
                         Expires at{" "}
@@ -550,7 +684,8 @@ function App() {
                     <>
                       {trustCheck?.state === "verified" && (
                         <p role="status">
-                          Trust verified for this client
+                          Trust verified for{" "}
+                          {trustCheck.client?.name ?? "this client"}
                           {trustCheck.verifiedAt
                             ? ` at ${new Date(trustCheck.verifiedAt).toLocaleTimeString()}`
                             : ""}
@@ -580,7 +715,10 @@ function App() {
                       </label>
                       <button
                         disabled={
-                          caBusy || trustCheckBusy || !trustCheckConsent
+                          caBusy ||
+                          trustCheckBusy ||
+                          !trustCheckConsent ||
+                          !selectedClient
                         }
                         onClick={() =>
                           void trustCheckCommand("start_tls_trust_check")

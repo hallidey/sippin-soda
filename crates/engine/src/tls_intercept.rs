@@ -37,7 +37,45 @@ pub enum TlsReadinessState {
     MissingCa,
     ExpiredCa,
     ClientTrustUnverified,
+    ClientMismatch,
     Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsClientIdentity {
+    id: String,
+    name: String,
+}
+
+impl TlsClientIdentity {
+    pub fn new(id: &str, name: &str) -> Result<Self, String> {
+        let id = id.trim();
+        let name = name.trim();
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("Client profile IDs must use 1-64 letters, numbers, '-' or '_'.".into());
+        }
+        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            return Err("Client profile names must contain 1-80 visible characters.".into());
+        }
+        Ok(Self {
+            id: id.into(),
+            name: name.into(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,6 +84,7 @@ pub struct TlsInspectionReadiness {
     pub state: TlsReadinessState,
     pub can_inspect_development: bool,
     pub verified_host: Option<String>,
+    pub verified_client: Option<TlsClientIdentity>,
     pub proof_expires_at: Option<u64>,
 }
 
@@ -68,6 +107,7 @@ pub enum TlsTrustError {
 struct TlsClientTrustProof {
     issuer_fingerprint_sha256: String,
     verified_host: String,
+    client: TlsClientIdentity,
     expires_at: u64,
 }
 
@@ -89,6 +129,7 @@ impl TlsInspectionGate {
         &mut self,
         client: C,
         leaf: IssuedLeaf,
+        identity: TlsClientIdentity,
         handshake_timeout: Duration,
     ) -> Result<tokio_rustls::server::TlsStream<C>, TlsTrustError>
     where
@@ -98,16 +139,17 @@ impl TlsInspectionGate {
             return Err(TlsTrustError::InspectionDisabled);
         }
         self.trust_proof = None;
-        let (proof, stream) = client_trust_handshake(client, leaf, handshake_timeout).await?;
+        let (proof, stream) =
+            client_trust_handshake(client, leaf, identity, handshake_timeout).await?;
         self.trust_proof = Some(proof);
         Ok(stream)
     }
 
-    pub fn readiness(&self, ca: &CaStatus) -> TlsInspectionReadiness {
-        self.readiness_at(ca, unix_millis())
+    pub fn readiness(&self, ca: &CaStatus, client_id: &str) -> TlsInspectionReadiness {
+        self.readiness_at(ca, client_id, unix_millis())
     }
 
-    fn readiness_at(&self, ca: &CaStatus, now: u64) -> TlsInspectionReadiness {
+    fn readiness_at(&self, ca: &CaStatus, client_id: &str, now: u64) -> TlsInspectionReadiness {
         let state = if !self.opted_in {
             TlsReadinessState::Disabled
         } else if ca.state != "ready" || ca.fingerprint_sha256.is_none() || ca.expires_at.is_none()
@@ -120,6 +162,12 @@ impl TlsInspectionGate {
                 || proof.expires_at <= now
         }) {
             TlsReadinessState::ClientTrustUnverified
+        } else if self
+            .trust_proof
+            .as_ref()
+            .is_some_and(|proof| proof.client.id() != client_id)
+        {
+            TlsReadinessState::ClientMismatch
         } else {
             TlsReadinessState::Ready
         };
@@ -130,6 +178,7 @@ impl TlsInspectionGate {
             state,
             can_inspect_development: state == TlsReadinessState::Ready,
             verified_host: proof.map(|proof| proof.verified_host.clone()),
+            verified_client: proof.map(|proof| proof.client.clone()),
             proof_expires_at: proof.map(|proof| proof.expires_at),
         }
     }
@@ -137,9 +186,10 @@ impl TlsInspectionGate {
     pub fn authorize(
         &self,
         ca: &CaStatus,
+        client_id: &str,
         destination: DestinationClass,
     ) -> Result<(), TlsInspectionDenied> {
-        let readiness = self.readiness(ca);
+        let readiness = self.readiness(ca, client_id);
         if readiness.state != TlsReadinessState::Ready {
             return Err(TlsInspectionDenied::NotReady(readiness.state));
         }
@@ -159,10 +209,12 @@ fn unix_millis() -> u64 {
 
 /// Completes a real downstream TLS handshake. Success proves that this client
 /// accepted a leaf issued by the current CA; the proof is scoped to that CA,
-/// host and leaf lifetime and cannot be constructed by callers.
+/// host, selected client profile and leaf lifetime and cannot be constructed
+/// by callers.
 async fn client_trust_handshake<C>(
     client: C,
     leaf: IssuedLeaf,
+    identity: TlsClientIdentity,
     handshake_timeout: Duration,
 ) -> Result<(TlsClientTrustProof, tokio_rustls::server::TlsStream<C>), TlsTrustError>
 where
@@ -171,6 +223,7 @@ where
     let proof = TlsClientTrustProof {
         issuer_fingerprint_sha256: leaf.issuer_fingerprint_sha256.clone(),
         verified_host: leaf.host.clone(),
+        client: identity,
         expires_at: leaf.expires_at,
     };
     let server = ServerConfig::builder()
@@ -316,54 +369,74 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn client_identity_is_canonical_and_bounded() {
+        let identity = TlsClientIdentity::new(" browser-1 ", " Development browser ").unwrap();
+        assert_eq!(identity.id(), "browser-1");
+        assert_eq!(identity.name(), "Development browser");
+        assert!(TlsClientIdentity::new("browser/1", "Browser").is_err());
+        assert!(TlsClientIdentity::new("browser-1", "\n").is_err());
+        assert!(TlsClientIdentity::new("browser-1", &"é".repeat(81)).is_err());
+    }
+
     #[tokio::test]
     async fn readiness_requires_opt_in_current_ca_and_real_client_trust() {
         let (ca_pem, leaf, status) = CaManager::ephemeral_leaf_for_test("client.dev.test");
+        let identity = TlsClientIdentity::new("browser-1", "Development browser").unwrap();
         let (server_side, client_side) = tokio::io::duplex(16 * 1024);
         let mut gate = TlsInspectionGate::default();
-        assert_eq!(gate.readiness(&status).state, TlsReadinessState::Disabled);
+        assert_eq!(
+            gate.readiness(&status, identity.id()).state,
+            TlsReadinessState::Disabled
+        );
         gate.set_opt_in(true);
         assert_eq!(
-            gate.readiness(&status).state,
+            gate.readiness(&status, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
-        let verification = gate.verify_client_trust(server_side, leaf, Duration::from_secs(2));
+        let verification =
+            gate.verify_client_trust(server_side, leaf, identity.clone(), Duration::from_secs(2));
         let client_connection = downstream_client(client_side, ca_pem.as_bytes());
         let (verification, client) = tokio::join!(verification, client_connection);
         drop(verification.unwrap());
         drop(client.unwrap());
-        let readiness = gate.readiness(&status);
+        let readiness = gate.readiness(&status, identity.id());
         assert_eq!(readiness.state, TlsReadinessState::Ready);
         assert!(readiness.can_inspect_development);
         assert_eq!(readiness.verified_host.as_deref(), Some("client.dev.test"));
+        assert_eq!(readiness.verified_client.as_ref(), Some(&identity));
         assert_eq!(
-            gate.readiness_at(&status, readiness.proof_expires_at.unwrap())
+            gate.readiness(&status, "different-client").state,
+            TlsReadinessState::ClientMismatch
+        );
+        assert_eq!(
+            gate.readiness_at(&status, identity.id(), readiness.proof_expires_at.unwrap())
                 .state,
             TlsReadinessState::ClientTrustUnverified
         );
         assert_eq!(
-            gate.authorize(&status, DestinationClass::Development),
+            gate.authorize(&status, identity.id(), DestinationClass::Development),
             Ok(())
         );
         assert_eq!(
-            gate.authorize(&status, DestinationClass::Production),
+            gate.authorize(&status, identity.id(), DestinationClass::Production),
             Err(TlsInspectionDenied::ProductionReadOnly)
         );
         assert_eq!(
-            gate.authorize(&status, DestinationClass::Unknown),
+            gate.authorize(&status, identity.id(), DestinationClass::Unknown),
             Err(TlsInspectionDenied::DestinationUnclassified)
         );
         let mut rotated = status.clone();
         rotated.fingerprint_sha256 = Some("rotated-ca".into());
         assert_eq!(
-            gate.readiness(&rotated).state,
+            gate.readiness(&rotated, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
 
         gate.set_opt_in(false);
         gate.set_opt_in(true);
         assert_eq!(
-            gate.readiness(&status).state,
+            gate.readiness(&status, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
     }
@@ -371,10 +444,12 @@ mod tests {
     #[tokio::test]
     async fn readiness_rejects_changed_or_expired_ca_and_failed_trust_handshake() {
         let (_ca_pem, leaf, mut status) = CaManager::ephemeral_leaf_for_test("client.dev.test");
+        let identity = TlsClientIdentity::new("runtime-1", "Test runtime").unwrap();
         let (server_side, client_side) = tokio::io::duplex(16 * 1024);
         let mut gate = TlsInspectionGate::default();
         gate.set_opt_in(true);
-        let verification = gate.verify_client_trust(server_side, leaf, Duration::from_secs(2));
+        let verification =
+            gate.verify_client_trust(server_side, leaf, identity.clone(), Duration::from_secs(2));
         let untrusted = TlsConnector::from(Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(RootCertStore::empty())
@@ -391,17 +466,17 @@ mod tests {
             Err(TlsTrustError::ClientRejectedCertificate)
         ));
         assert_eq!(
-            gate.readiness(&status).state,
+            gate.readiness(&status, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
         status.expires_at = Some(1);
         assert_eq!(
-            gate.readiness_at(&status, 2).state,
+            gate.readiness_at(&status, identity.id(), 2).state,
             TlsReadinessState::ExpiredCa
         );
         status.state = "absent".into();
         assert_eq!(
-            gate.readiness_at(&status, 2).state,
+            gate.readiness_at(&status, identity.id(), 2).state,
             TlsReadinessState::MissingCa
         );
 
@@ -410,7 +485,7 @@ mod tests {
         let mut disabled = TlsInspectionGate::default();
         assert!(matches!(
             disabled
-                .verify_client_trust(server_side, leaf, Duration::from_secs(2))
+                .verify_client_trust(server_side, leaf, identity, Duration::from_secs(2))
                 .await,
             Err(TlsTrustError::InspectionDisabled)
         ));

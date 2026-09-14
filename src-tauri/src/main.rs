@@ -3,7 +3,8 @@
 use serde::Serialize;
 use sippin_soda_engine::{
     BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus, ProxyConfig,
-    ProxyEngine, SearchStep, Snapshot, TlsTrustCheckManager, TlsTrustCheckStatus,
+    ProxyEngine, SearchStep, Snapshot, TlsClientIdentity, TlsTrustCheckManager,
+    TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -254,14 +255,19 @@ fn tls_trust_check_status(
 async fn start_tls_trust_check(
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+    client_id: String,
+    client_name: String,
 ) -> Result<TlsTrustCheckStatus, String> {
+    let client = TlsClientIdentity::new(&client_id, &client_name)?;
     let ca = ca.inner().clone();
     let leaf = tauri::async_runtime::spawn_blocking(move || {
         ca.issue_leaf("localhost", DestinationClass::Development)
     })
     .await
     .map_err(|_| "TLS trust-check certificate worker failed.".to_string())??;
-    trust_check.start(leaf, Duration::from_secs(60)).await
+    trust_check
+        .start(leaf, client, Duration::from_secs(60))
+        .await
 }
 
 #[tauri::command]

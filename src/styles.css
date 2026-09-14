@@ -26,7 +26,8 @@ body {
   margin: 0;
 }
 button,
-select {
+select,
+input {
   font: inherit;
 }
 button {
@@ -411,6 +412,27 @@ select {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+.client-profile-editor {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+}
+.client-profile-editor select,
+.client-profile-editor input {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.client-profile-editor input {
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 8px;
+}
+.client-profile-editor .muted {
+  margin: 0;
+  font-size: 12px;
 }
 dl {
   display: grid;

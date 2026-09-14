@@ -1,4 +1,7 @@
-use crate::{CaStatus, IssuedLeaf, TlsInspectionGate, TlsInspectionReadiness, TlsTrustError};
+use crate::{
+    CaStatus, IssuedLeaf, TlsClientIdentity, TlsInspectionGate, TlsInspectionReadiness,
+    TlsTrustError,
+};
 use serde::Serialize;
 use std::{
     net::Ipv4Addr,
@@ -21,6 +24,7 @@ pub enum TlsTrustCheckState {
 #[serde(rename_all = "camelCase")]
 pub struct TlsTrustCheckStatus {
     pub state: TlsTrustCheckState,
+    pub client: Option<TlsClientIdentity>,
     pub url: Option<String>,
     pub expires_at: Option<u64>,
     pub verified_at: Option<u64>,
@@ -31,6 +35,7 @@ impl TlsTrustCheckStatus {
     fn idle() -> Self {
         Self {
             state: TlsTrustCheckState::Idle,
+            client: None,
             url: None,
             expires_at: None,
             verified_at: None,
@@ -62,17 +67,18 @@ impl TlsTrustCheckManager {
         self.status.lock().unwrap().clone()
     }
 
-    pub fn readiness(&self, ca: &CaStatus) -> Option<TlsInspectionReadiness> {
+    pub fn readiness(&self, ca: &CaStatus, client_id: &str) -> Option<TlsInspectionReadiness> {
         self.gate
             .lock()
             .unwrap()
             .as_ref()
-            .map(|gate| gate.readiness(ca))
+            .map(|gate| gate.readiness(ca, client_id))
     }
 
     pub async fn start(
         &self,
         leaf: IssuedLeaf,
+        client: TlsClientIdentity,
         valid_for: Duration,
     ) -> Result<TlsTrustCheckStatus, String> {
         if !(Duration::from_secs(5)..=Duration::from_secs(120)).contains(&valid_for) {
@@ -88,6 +94,7 @@ impl TlsTrustCheckManager {
         let expires_at = unix_millis().saturating_add(valid_for.as_millis() as u64);
         let waiting = TlsTrustCheckStatus {
             state: TlsTrustCheckState::Waiting,
+            client: Some(client.clone()),
             url: Some(format!("https://localhost:{}/", address.port())),
             expires_at: Some(expires_at),
             verified_at: None,
@@ -100,12 +107,13 @@ impl TlsTrustCheckManager {
         let gate_store = self.gate.clone();
         let proof_expires_at = leaf.expires_at;
         let task = tokio::spawn(async move {
-            let outcome = run_check(listener, leaf, valid_for).await;
+            let outcome = run_check(listener, leaf, client.clone(), valid_for).await;
             let next = match outcome {
                 Ok(gate) => {
                     *gate_store.lock().unwrap() = Some(gate);
                     TlsTrustCheckStatus {
                         state: TlsTrustCheckState::Verified,
+                        client: Some(client.clone()),
                         url: None,
                         expires_at: Some(proof_expires_at),
                         verified_at: Some(unix_millis()),
@@ -114,6 +122,7 @@ impl TlsTrustCheckManager {
                 }
                 Err(CheckFailure::Expired) => TlsTrustCheckStatus {
                     state: TlsTrustCheckState::Expired,
+                    client: Some(client.clone()),
                     url: None,
                     expires_at: None,
                     verified_at: None,
@@ -121,6 +130,7 @@ impl TlsTrustCheckManager {
                 },
                 Err(CheckFailure::Rejected) => TlsTrustCheckStatus {
                     state: TlsTrustCheckState::Failed,
+                    client: Some(client),
                     url: None,
                     expires_at: None,
                     verified_at: None,
@@ -160,6 +170,7 @@ enum CheckFailure {
 async fn run_check(
     listener: TcpListener,
     leaf: IssuedLeaf,
+    client: TlsClientIdentity,
     valid_for: Duration,
 ) -> Result<TlsInspectionGate, CheckFailure> {
     let (socket, _) = timeout(valid_for, listener.accept())
@@ -169,7 +180,7 @@ async fn run_check(
     let mut gate = TlsInspectionGate::default();
     gate.set_opt_in(true);
     let mut tls = gate
-        .verify_client_trust(socket, leaf, Duration::from_secs(10))
+        .verify_client_trust(socket, leaf, client, Duration::from_secs(10))
         .await
         .map_err(|error| match error {
             TlsTrustError::HandshakeTimeout => CheckFailure::Expired,
@@ -220,12 +231,21 @@ mod tests {
             .unwrap()
     }
 
+    fn client() -> TlsClientIdentity {
+        TlsClientIdentity::new("browser-1", "Development browser").unwrap()
+    }
+
     #[tokio::test]
     async fn verifies_one_trusted_client_and_returns_a_local_confirmation() {
         let (ca_pem, leaf, ca_status) = CaManager::ephemeral_leaf_for_test("localhost");
         let manager = TlsTrustCheckManager::default();
-        let waiting = manager.start(leaf, Duration::from_secs(5)).await.unwrap();
+        let identity = client();
+        let waiting = manager
+            .start(leaf, identity.clone(), Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(waiting.state, TlsTrustCheckState::Waiting);
+        assert_eq!(waiting.client.as_ref(), Some(&identity));
         let socket = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port(&waiting)))
             .await
             .unwrap();
@@ -255,8 +275,11 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(manager.status().state, TlsTrustCheckState::Verified);
         assert!(manager
-            .readiness(&ca_status)
+            .readiness(&ca_status, identity.id())
             .is_some_and(|readiness| readiness.can_inspect_development));
+        assert!(manager
+            .readiness(&ca_status, "other-client")
+            .is_some_and(|readiness| !readiness.can_inspect_development));
         assert!(
             tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port(&waiting)))
                 .await
@@ -269,7 +292,11 @@ mod tests {
     async fn rejected_client_closes_the_check_without_readiness() {
         let (_, leaf, ca_status) = CaManager::ephemeral_leaf_for_test("localhost");
         let manager = TlsTrustCheckManager::default();
-        let waiting = manager.start(leaf, Duration::from_secs(5)).await.unwrap();
+        let identity = client();
+        let waiting = manager
+            .start(leaf, identity.clone(), Duration::from_secs(5))
+            .await
+            .unwrap();
         let socket = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port(&waiting)))
             .await
             .unwrap();
@@ -292,7 +319,7 @@ mod tests {
         let status = manager.status();
         assert_eq!(status.state, TlsTrustCheckState::Failed);
         assert!(status.url.is_none());
-        assert!(manager.readiness(&ca_status).is_none());
+        assert!(manager.readiness(&ca_status, identity.id()).is_none());
         manager.cancel().await;
     }
 
@@ -300,14 +327,18 @@ mod tests {
     async fn cancellation_and_timeout_clear_readiness() {
         let (_, leaf, ca_status) = CaManager::ephemeral_leaf_for_test("localhost");
         let manager = TlsTrustCheckManager::default();
-        manager.start(leaf, Duration::from_secs(5)).await.unwrap();
+        let identity = client();
+        manager
+            .start(leaf, identity.clone(), Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(manager.cancel().await.state, TlsTrustCheckState::Idle);
-        assert!(manager.readiness(&ca_status).is_none());
+        assert!(manager.readiness(&ca_status, identity.id()).is_none());
 
         let (_, leaf, _) = CaManager::ephemeral_leaf_for_test("localhost");
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         assert!(matches!(
-            run_check(listener, leaf, Duration::from_millis(10)).await,
+            run_check(listener, leaf, client(), Duration::from_millis(10)).await,
             Err(CheckFailure::Expired)
         ));
     }
