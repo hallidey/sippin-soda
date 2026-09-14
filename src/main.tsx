@@ -147,6 +147,7 @@ function App() {
   );
   const [newClientName, setNewClientName] = useState("");
   const [requireClientAuth, setRequireClientAuth] = useState(false);
+  const [enableHttpsInspection, setEnableHttpsInspection] = useState(false);
   const [proxyCredential, setProxyCredential] =
     useState<ProxyCredential | null>(null);
   const [tlsPreflight, setTlsPreflight] =
@@ -189,6 +190,14 @@ function App() {
     Number(diskBudget) <= 1024;
   const validPort =
     /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+  const canRequestHttpsInspection =
+    requireClientAuth &&
+    selectedClient !== null &&
+    caStatus?.state === "ready" &&
+    (caStatus.expiresAt ?? 0) > Date.now() &&
+    trustCheck?.state === "verified" &&
+    trustCheck.client?.id === selectedClient.id &&
+    (trustCheck.expiresAt ?? 0) > Date.now();
   const preflightMessage: Record<TlsInspectionPreflight["state"], string> = {
     proxy_stopped: "Start the proxy before evaluating HTTPS inspection.",
     client_authentication_required:
@@ -230,6 +239,7 @@ function App() {
         productionHosts: parsedProductionHosts,
         clientProfileId: credential?.profileId ?? null,
         clientToken: credential?.token ?? null,
+        enableHttpsInspection,
       },
     });
     setProxyCredential(started ? credential : null);
@@ -248,6 +258,9 @@ function App() {
       setSelectedClientId(clientProfiles[0]?.id ?? "");
     }
   }, [clientProfiles, selectedClientId]);
+  useEffect(() => {
+    if (!canRequestHttpsInspection) setEnableHttpsInspection(false);
+  }, [canRequestHttpsInspection]);
   useEffect(() => {
     if (!desktop) return;
     let active = true;
@@ -276,6 +289,15 @@ function App() {
       .then(setTlsPreflight)
       .catch((cause) => setCaMessage(String(cause)));
   }, [desktop, snapshot?.revision, trustCheck?.state]);
+  useEffect(() => {
+    if (!desktop || !status?.httpsInspection) return;
+    const timer = window.setInterval(() => {
+      void invoke<TlsInspectionPreflight>("tls_inspection_preflight")
+        .then(setTlsPreflight)
+        .catch((cause) => setCaMessage(String(cause)));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [desktop, status?.httpsInspection]);
   useEffect(() => {
     if (!desktop || trustCheck?.state !== "waiting") return;
     const timer = window.setInterval(() => {
@@ -468,7 +490,8 @@ function App() {
                       !validBudget ||
                       !validRedactionPaths ||
                       !validHostRules ||
-                      (requireClientAuth && !selectedClient)))
+                      (requireClientAuth && !selectedClient) ||
+                      (enableHttpsInspection && !canRequestHttpsInspection)))
                 }
                 onClick={() => void proxyCommand()}
               >
@@ -524,6 +547,23 @@ function App() {
                   </select>
                 </label>
               )}
+              {requireClientAuth && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={enableHttpsInspection}
+                    disabled={
+                      running || busy || !desktop || !canRequestHttpsInspection
+                    }
+                    onChange={(event) =>
+                      setEnableHttpsInspection(event.target.checked)
+                    }
+                  />{" "}
+                  Explicitly enable TLS termination for authenticated
+                  Development CONNECT destinations. HTTPS request contents are
+                  not captured yet.
+                </label>
+              )}
               {running && proxyCredential && (
                 <div className="proxy-credential" role="status">
                   <strong>
@@ -559,14 +599,21 @@ function App() {
                   <strong>
                     HTTPS inspection preflight: {tlsPreflight.state}
                   </strong>
-                  <p>{preflightMessage[tlsPreflight.state]}</p>
+                  <p>
+                    {tlsPreflight.httpsInspectionActive
+                      ? "Development CONNECT destinations now use the verified TLS transport bridge. Inner HTTP capture is not active yet."
+                      : preflightMessage[tlsPreflight.state]}
+                  </p>
                   {tlsPreflight.proofExpiresAt && (
                     <p>
                       Trust proof expires{" "}
                       {new Date(tlsPreflight.proofExpiresAt).toLocaleString()}.
                     </p>
                   )}
-                  <p>HTTPS inspection active: no.</p>
+                  <p>
+                    HTTPS inspection active:{" "}
+                    {tlsPreflight.httpsInspectionActive ? "yes" : "no"}.
+                  </p>
                 </div>
               )}
               <label>
@@ -681,9 +728,11 @@ function App() {
               <dd>{status?.listenAddress ?? "127.0.0.1:8080"}</dd>
               <dt>HTTPS inspection</dt>
               <dd>
-                {caStatus?.state === "ready"
-                  ? "Disabled · local CA generated but not installed"
-                  : "Disabled · no local CA generated"}
+                {status?.httpsInspection
+                  ? "Enabled · Development TLS termination only"
+                  : caStatus?.state === "ready"
+                    ? "Disabled · local CA generated but not installed"
+                    : "Disabled · no local CA generated"}
               </dd>
               <dt>HTTPS pass-through</dt>
               <dd>CONNECT supported · 5 minute tunnel limit</dd>
@@ -867,7 +916,7 @@ function App() {
                         <input
                           type="checkbox"
                           checked={trustCheckConsent}
-                          disabled={caBusy || trustCheckBusy}
+                          disabled={running || caBusy || trustCheckBusy}
                           onChange={(event) =>
                             setTrustCheckConsent(event.target.checked)
                           }
@@ -879,6 +928,7 @@ function App() {
                         disabled={
                           caBusy ||
                           trustCheckBusy ||
+                          running ||
                           !trustCheckConsent ||
                           !selectedClient
                         }

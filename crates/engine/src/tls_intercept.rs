@@ -1,4 +1,5 @@
 use crate::{authorize, Action, CaStatus, DestinationClass, IssuedLeaf, PolicyError};
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Serialize;
 use std::{
     sync::Arc,
@@ -264,6 +265,42 @@ pub async fn bridge_verified_tls<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth(),
+    );
+    bridge_verified_tls_with_config(
+        client,
+        upstream,
+        upstream_name,
+        leaf,
+        client_config,
+        handshake_timeout,
+        lifetime,
+    )
+    .await
+}
+
+pub(crate) fn platform_tls_client_config() -> Result<Arc<ClientConfig>, String> {
+    ClientConfig::builder()
+        .with_platform_verifier()
+        .map(|builder| Arc::new(builder.with_no_client_auth()))
+        .map_err(|_| "Cannot initialize platform TLS certificate verification.".into())
+}
+
+pub(crate) async fn bridge_verified_tls_with_config<C>(
+    client: C,
+    upstream: tokio::net::TcpStream,
+    upstream_name: &str,
+    leaf: IssuedLeaf,
+    client_config: Arc<ClientConfig>,
+    handshake_timeout: Duration,
+    lifetime: Duration,
+) -> Result<TlsBridgeResult, TlsInterceptError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let upstream_name = ServerName::try_from(upstream_name.to_owned())
         .map_err(|_| TlsInterceptError::InvalidUpstreamName)?;
     let server = ServerConfig::builder()
@@ -273,12 +310,8 @@ where
             PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
         )
         .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
-    let client_config = ClientConfig::builder()
-        .with_root_certificates(upstream_roots)
-        .with_no_client_auth();
     let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
-    let verified_upstream =
-        TlsConnector::from(Arc::new(client_config)).connect(upstream_name, upstream);
+    let verified_upstream = TlsConnector::from(client_config).connect(upstream_name, upstream);
     let (downstream, verified_upstream) = tokio::time::timeout(handshake_timeout, async {
         let upstream = verified_upstream
             .await

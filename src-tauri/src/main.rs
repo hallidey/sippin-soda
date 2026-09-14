@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use sippin_soda_engine::{
     BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus,
-    ProxyClientAuth, ProxyConfig, ProxyEngine, SearchStep, Snapshot, TlsClientIdentity,
-    TlsInspectionPreflight, TlsTrustCheckManager, TlsTrustCheckStatus,
+    ProxyClientAuth, ProxyConfig, ProxyEngine, ProxyTlsInterception, SearchStep, Snapshot,
+    TlsClientIdentity, TlsInspectionPreflight, TlsTrustCheckManager, TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -28,6 +28,7 @@ struct StartProxyOptions {
     production_hosts: Vec<String>,
     client_profile_id: Option<String>,
     client_token: Option<String>,
+    enable_https_inspection: bool,
 }
 
 #[tauri::command]
@@ -38,6 +39,8 @@ fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
 #[tauri::command]
 async fn start_proxy(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
+    ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     options: StartProxyOptions,
 ) -> Result<Snapshot, String> {
     if !(1..=1024).contains(&options.disk_budget_gib) {
@@ -48,6 +51,31 @@ async fn start_proxy(
         (Some(profile_id), Some(token)) => Some(ProxyClientAuth::new(&profile_id, &token)?),
         _ => return Err("Proxy client profile and token must be configured together.".into()),
     };
+    let tls_interception = if options.enable_https_inspection {
+        let profile_id = client_auth
+            .as_ref()
+            .map(ProxyClientAuth::profile_id)
+            .ok_or("HTTPS inspection requires client profile authentication.")?;
+        let ca_worker = ca.inner().clone();
+        let ca_status = tauri::async_runtime::spawn_blocking(move || ca_worker.status())
+            .await
+            .map_err(|_| "HTTPS inspection CA worker failed.".to_string())??;
+        if !trust_check
+            .readiness(&ca_status, profile_id)
+            .is_some_and(|readiness| readiness.can_inspect_development)
+        {
+            return Err(
+                "Verify CA trust with this client profile before enabling HTTPS inspection.".into(),
+            );
+        }
+        Some(ProxyTlsInterception::platform(
+            ca.inner().clone(),
+            trust_check.inner().clone(),
+            profile_id,
+        )?)
+    } else {
+        None
+    };
     engine
         .start(ProxyConfig {
             port: options.port,
@@ -57,6 +85,7 @@ async fn start_proxy(
             development_hosts: options.development_hosts,
             production_hosts: options.production_hosts,
             client_auth,
+            tls_interception,
             ..Default::default()
         })
         .await
@@ -207,10 +236,12 @@ async fn ca_status(ca: tauri::State<'_, Arc<CaManager>>) -> Result<CaStatus, Str
 
 #[tauri::command]
 async fn generate_local_ca(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     consent: bool,
 ) -> Result<CaStatus, String> {
+    engine.stop().await;
     trust_check.cancel().await;
     let ca = ca.inner().clone();
     tauri::async_runtime::spawn_blocking(move || ca.generate(consent))
@@ -220,10 +251,12 @@ async fn generate_local_ca(
 
 #[tauri::command]
 async fn remove_local_ca(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     confirmed: bool,
 ) -> Result<CaStatus, String> {
+    engine.stop().await;
     trust_check.cancel().await;
     let ca = ca.inner().clone();
     tauri::async_runtime::spawn_blocking(move || ca.remove(confirmed))

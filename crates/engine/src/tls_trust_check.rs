@@ -146,7 +146,8 @@ impl TlsTrustCheckManager {
         TlsInspectionPreflight {
             state,
             can_enable_development: state == TlsInspectionPreflightState::Ready,
-            https_inspection_active: false,
+            https_inspection_active: proxy.https_inspection
+                && state == TlsInspectionPreflightState::Ready,
             client_profile_id: Some(client_id.into()),
             verified_client: readiness.verified_client,
             proof_expires_at: readiness.proof_expires_at,
@@ -408,6 +409,12 @@ mod tests {
         assert!(preflight.can_enable_development);
         assert!(!preflight.https_inspection_active);
         assert_eq!(preflight.verified_client.as_ref(), Some(&identity));
+        proxy.https_inspection = true;
+        assert!(
+            manager
+                .preflight(&ca_status, &proxy)
+                .https_inspection_active
+        );
         assert!(
             tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port(&waiting)))
                 .await

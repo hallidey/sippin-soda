@@ -60,7 +60,10 @@ export function Traffic({
         </p>
         <p>
           HTTP metadata + optional body inspection · JSON requests are redacted
-          before storage · HTTPS content stays encrypted; no CA is installed.
+          before storage ·{" "}
+          {snapshot?.status.httpsInspection
+            ? "Development TLS termination is enabled; inner HTTP capture is not implemented yet."
+            : "HTTPS content stays encrypted; no CA is installed."}
         </p>
       </div>
       <div className="traffic-toolbar">
@@ -125,9 +128,11 @@ export function Traffic({
                 <td>
                   {capture.phase === "error"
                     ? `${capture.status ?? "—"} · Error`
-                    : capture.kind === "tunnel" && capture.status === 200
-                      ? "200 · Tunnel"
-                      : (capture.status ?? "Pending")}
+                    : capture.kind === "tls" && capture.status === 200
+                      ? "200 · TLS bridge"
+                      : capture.kind === "tunnel" && capture.status === 200
+                        ? "200 · Tunnel"
+                        : (capture.status ?? "Pending")}
                 </td>
                 <td>
                   {capture.phase === "pending"
@@ -190,6 +195,13 @@ export function Traffic({
                 counts include transport data such as TLS handshakes.
               </p>
             )}
+            {selected.kind === "tls" && (
+              <p className="capture-notice">
+                Development TLS was terminated and separately verified upstream.
+                Byte counts describe forwarded plaintext, but inner HTTP
+                metadata and bodies are not captured in this increment.
+              </p>
+            )}
             <div className="detail-tabs" aria-label="Inspector view">
               {["Request", "Response", "Timing"].map((name) => (
                 <button
@@ -212,7 +224,7 @@ export function Traffic({
                   {selected.requestBytes.toLocaleString()} bytes forwarded.
                   Query values and non-allowlisted header values are redacted.
                 </p>
-                {selected.kind === "tunnel" && (
+                {selected.kind !== "http" && (
                   <p>CONNECT negotiation headers only.</p>
                 )}
                 <Headers values={selected.requestHeaders} />
@@ -273,9 +285,12 @@ export function Traffic({
               </dl>
             )}
             <p>
-              Encrypted tunnel contents are not recorded. HTTP body recording
-              must be enabled before Start; request inspection currently accepts
-              JSON up to 1 MiB and stores only its redacted copy.
+              {selected.kind === "tls"
+                ? "Terminated TLS plaintext is forwarded without HTTP content recording in this increment. "
+                : "Encrypted tunnel contents are not recorded. "}
+              HTTP body recording must be enabled before Start; request
+              inspection currently accepts JSON up to 1 MiB and stores only its
+              redacted copy.
             </p>
           </>
         ) : (

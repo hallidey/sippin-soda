@@ -1,4 +1,7 @@
-use crate::{DestinationClass, EnginePhase, EngineStatus, TlsClientIdentity};
+use crate::{
+    bridge_verified_tls_with_config, platform_tls_client_config, CaManager, DestinationClass,
+    EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsTrustCheckManager,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 mod bodies;
 mod tunnel;
@@ -18,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     convert::Infallible,
+    fmt,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -31,6 +35,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
+use tokio_rustls::rustls::ClientConfig;
 use tunnel::Tunnel;
 
 type WireBody = BoxBody<Bytes, hyper::Error>;
@@ -48,6 +53,93 @@ pub struct ProxyConfig {
     pub development_hosts: Vec<String>,
     pub production_hosts: Vec<String>,
     pub client_auth: Option<ProxyClientAuth>,
+    pub tls_interception: Option<ProxyTlsInterception>,
+}
+
+type LeafIssuer =
+    dyn Fn(&str, DestinationClass) -> Result<Option<IssuedLeaf>, String> + Send + Sync;
+
+#[derive(Clone)]
+pub struct ProxyTlsInterception {
+    profile_id: String,
+    upstream_config: Arc<ClientConfig>,
+    issue_leaf: Arc<LeafIssuer>,
+}
+
+impl fmt::Debug for ProxyTlsInterception {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProxyTlsInterception")
+            .field("profile_id", &self.profile_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxyTlsInterception {
+    pub fn platform(
+        ca: Arc<CaManager>,
+        trust: Arc<TlsTrustCheckManager>,
+        profile_id: &str,
+    ) -> Result<Self, String> {
+        let profile_id = TlsClientIdentity::validate_id(profile_id)?;
+        let proof_profile_id = profile_id.clone();
+        let issue_leaf = Arc::new(move |host: &str, destination: DestinationClass| {
+            if destination != DestinationClass::Development {
+                return Ok(None);
+            }
+            let status = ca.status()?;
+            let ready = trust
+                .readiness(&status, &proof_profile_id)
+                .is_some_and(|readiness| readiness.can_inspect_development);
+            if !ready {
+                return Ok(None);
+            }
+            let leaf = ca.issue_leaf(host, destination)?;
+            if Some(&leaf.issuer_fingerprint_sha256) != status.fingerprint_sha256.as_ref() {
+                return Err("The local CA changed while preparing TLS interception.".into());
+            }
+            Ok(Some(leaf))
+        });
+        Ok(Self {
+            profile_id,
+            upstream_config: platform_tls_client_config()?,
+            issue_leaf,
+        })
+    }
+
+    fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    async fn prepare(
+        &self,
+        host: &str,
+        destination: DestinationClass,
+        client_profile_id: Option<&str>,
+    ) -> Result<Option<TlsInterceptRoute>, String> {
+        if destination != DestinationClass::Development
+            || client_profile_id != Some(self.profile_id())
+        {
+            return Ok(None);
+        }
+        let issue_leaf = self.issue_leaf.clone();
+        let host = host.to_owned();
+        let worker_host = host.clone();
+        let leaf = tokio::task::spawn_blocking(move || issue_leaf(&worker_host, destination))
+            .await
+            .map_err(|_| "TLS certificate worker failed.".to_string())??;
+        Ok(leaf.map(|leaf| TlsInterceptRoute {
+            host,
+            leaf,
+            upstream_config: self.upstream_config.clone(),
+        }))
+    }
+}
+
+struct TlsInterceptRoute {
+    host: String,
+    leaf: IssuedLeaf,
+    upstream_config: Arc<ClientConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +210,7 @@ impl Default for ProxyConfig {
             development_hosts: vec![],
             production_hosts: vec![],
             client_auth: None,
+            tls_interception: None,
         }
     }
 }
@@ -545,6 +638,15 @@ impl ProxyEngine {
         {
             return Err("Invalid proxy resource limits.".into());
         }
+        if let Some(tls) = &config.tls_interception {
+            if config.client_auth.as_ref().map(ProxyClientAuth::profile_id)
+                != Some(tls.profile_id())
+            {
+                return Err(
+                    "HTTPS inspection requires authentication for the same client profile.".into(),
+                );
+            }
+        }
         let request_redaction_paths =
             bodies::compile_redaction_paths(&config.request_redaction_paths)?;
         let destination_classifier =
@@ -574,6 +676,7 @@ impl ProxyEngine {
                 .client_auth
                 .as_ref()
                 .map(|auth| auth.profile_id().to_owned());
+            state.status.https_inspection = config.tls_interception.is_some();
             state.revision += 1;
         }
         let (shutdown, mut stop) = oneshot::channel();
@@ -596,12 +699,13 @@ impl ProxyEngine {
                         }
                         let shared = shared.clone();
                         let client_auth = config.client_auth.clone();
+                        let tls_interception = config.tls_interception.clone();
                         let deadline = config.request_timeout;
                         let tunnel_deadline = config.tunnel_timeout;
                         connections.spawn(async move {
                             let (tunnel_tx, mut tunnel_rx) = oneshot::channel::<Tunnel>();
                             let tunnel_slot = Arc::new(Mutex::new(Some(tunnel_tx)));
-                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone(), client_auth.clone()));
+                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone(), client_auth.clone(), tls_interception.clone()));
                             // The same tracked task owns HTTP negotiation AND the tunnel,
                             // so upgrades cannot escape the connection cap or Stop.
                             let mut builder = http1::Builder::new();
@@ -620,6 +724,7 @@ impl ProxyEngine {
             let mut state = shared.lock().unwrap();
             state.status.phase = EnginePhase::Stopped;
             state.status.client_profile_id = None;
+            state.status.https_inspection = false;
             state.revision += 1;
         });
         *running = Some(Running { shutdown, task });
@@ -943,6 +1048,7 @@ async fn handle(
     deadline: Duration,
     tunnel_slot: Arc<Mutex<Option<oneshot::Sender<Tunnel>>>>,
     client_auth: Option<ProxyClientAuth>,
+    tls_interception: Option<ProxyTlsInterception>,
 ) -> Result<Response<WireBody>, Infallible> {
     let client_profile_id = match client_auth {
         Some(auth) if auth.accepts(request.headers()) => Some(auth.profile_id().to_owned()),
@@ -977,7 +1083,7 @@ async fn handle(
             method: request.method().to_string(),
             target: safe_target(&request),
             destination_class,
-            client_profile_id,
+            client_profile_id: client_profile_id.clone(),
             started_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1004,7 +1110,16 @@ async fn handle(
     };
     let operation = async {
         if request.method() == Method::CONNECT {
-            tunnel::establish(request, exchange.clone(), proxy, tunnel_slot).await
+            tunnel::establish(
+                request,
+                exchange.clone(),
+                proxy,
+                tunnel_slot,
+                destination_class,
+                client_profile_id.as_deref(),
+                tls_interception,
+            )
+            .await
         } else {
             forward(request, exchange.clone(), proxy).await
         }
@@ -1315,5 +1430,193 @@ mod destination_tests {
             &["*.example.com".into()]
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod tls_listener_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        rustls::{
+            pki_types::{PrivatePkcs8KeyDer, ServerName},
+            RootCertStore, ServerConfig,
+        },
+        TlsAcceptor, TlsConnector,
+    };
+
+    fn test_interception(
+        leaf: IssuedLeaf,
+        upstream_config: Arc<ClientConfig>,
+    ) -> ProxyTlsInterception {
+        let leaf = Arc::new(Mutex::new(Some(leaf)));
+        ProxyTlsInterception {
+            profile_id: "browser-1".into(),
+            upstream_config,
+            issue_leaf: Arc::new(move |_, destination| {
+                assert_eq!(destination, DestinationClass::Development);
+                Ok(leaf.lock().unwrap().take())
+            }),
+        }
+    }
+
+    async fn response_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            bytes.push(stream.read_u8().await.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_development_connect_uses_the_verified_tls_bridge() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let upstream_identity =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let upstream_server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![upstream_identity.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(upstream_identity.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut upstream_roots = RootCertStore::empty();
+        upstream_roots
+            .add(upstream_identity.cert.der().clone())
+            .unwrap();
+        let upstream_client_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(upstream_roots)
+                .with_no_client_auth(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = TlsAcceptor::from(Arc::new(upstream_server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut request = [0; 5];
+            tls.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"hello");
+            tls.write_all(b"world").await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("127.0.0.1");
+        let engine = ProxyEngine::default();
+        let snapshot = engine
+            .start(ProxyConfig {
+                port: 0,
+                client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
+                tls_interception: Some(test_interception(leaf, upstream_client_config)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(snapshot.status.https_inspection);
+        let mut client = TcpStream::connect(snapshot.status.listen_address)
+            .await
+            .unwrap();
+        let credentials = BASE64.encode(format!("browser-1:{TOKEN}"));
+        client
+            .write_all(
+                format!("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(response_headers(&mut client)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        let mut downstream_roots = RootCertStore::empty();
+        downstream_roots
+            .add(
+                rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut tls = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(downstream_roots)
+                .with_no_client_auth(),
+        ))
+        .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
+        .await
+        .unwrap();
+        tls.write_all(b"hello").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut reply = [0; 5];
+        tls.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"world");
+        tls.shutdown().await.unwrap();
+        upstream.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.snapshot().traffic[0].phase == "pending" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = engine.stop().await;
+        assert!(!snapshot.status.https_inspection);
+        let capture = &snapshot.traffic[0];
+        assert_eq!(capture.kind, "tls");
+        assert_eq!(capture.request_bytes, 5);
+        assert_eq!(capture.response_bytes, 5);
+        assert_eq!(capture.phase, "complete");
+    }
+
+    #[tokio::test]
+    async fn interception_route_rejects_non_development_and_mismatched_profiles() {
+        let called = Arc::new(AtomicBool::new(false));
+        let issuer_called = called.clone();
+        let interception = ProxyTlsInterception {
+            profile_id: "browser-1".into(),
+            upstream_config: Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+            issue_leaf: Arc::new(move |_, _| {
+                issuer_called.store(true, Ordering::SeqCst);
+                Ok(None)
+            }),
+        };
+        assert!(interception
+            .prepare(
+                "api.example.com",
+                DestinationClass::Production,
+                Some("browser-1"),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(interception
+            .prepare(
+                "api.dev.example",
+                DestinationClass::Development,
+                Some("other-client"),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(ProxyEngine::default()
+            .start(ProxyConfig {
+                port: 0,
+                client_auth: Some(
+                    ProxyClientAuth::new("other-client", "0123456789abcdef0123456789abcdef",)
+                        .unwrap(),
+                ),
+                tls_interception: Some(interception),
+                ..Default::default()
+            })
+            .await
+            .is_err());
     }
 }

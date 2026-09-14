@@ -6,6 +6,7 @@ pub(super) struct Tunnel {
     upgrade: hyper::upgrade::OnUpgrade,
     upstream: TcpStream,
     exchange: Arc<Exchange>,
+    interception: Option<TlsInterceptRoute>,
 }
 
 pub(super) async fn establish(
@@ -13,6 +14,9 @@ pub(super) async fn establish(
     exchange: Arc<Exchange>,
     proxy: SocketAddr,
     slot: Arc<Mutex<Option<oneshot::Sender<Tunnel>>>>,
+    destination: DestinationClass,
+    client_profile_id: Option<&str>,
+    tls_interception: Option<ProxyTlsInterception>,
 ) -> Result<Response<WireBody>, ForwardError> {
     let invalid = (
         StatusCode::BAD_REQUEST,
@@ -41,6 +45,18 @@ pub(super) async fn establish(
         .host()
         .trim_start_matches('[')
         .trim_end_matches(']');
+    let interception = match tls_interception {
+        Some(tls) => tls
+            .prepare(host, destination, client_profile_id)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "TLS interception preparation failed.",
+                )
+            })?,
+        None => None,
+    };
     // Establish upstream before acknowledging CONNECT. Proxy credentials and
     // HTTP request headers never enter the tunnel.
     let upstream = connect_upstream(host, port, proxy).await?;
@@ -50,12 +66,16 @@ pub(super) async fn establish(
         "Tunnel owner is unavailable.",
     ))?;
     exchange.update(|capture| capture.status = Some(200));
+    if interception.is_some() {
+        exchange.update(|capture| capture.kind = "tls".into());
+    }
     exchange.shared.lock().unwrap().revision += 1;
     sender
         .send(Tunnel {
             upgrade,
             upstream,
             exchange,
+            interception,
         })
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Proxy is stopping."))?;
     let mut result = response(StatusCode::OK, "");
@@ -69,6 +89,7 @@ impl Tunnel {
             upgrade,
             upstream,
             exchange,
+            interception,
         } = self;
         let upgraded = match timeout(handshake_timeout, upgrade).await {
             Ok(Ok(io)) => io,
@@ -77,6 +98,29 @@ impl Tunnel {
                 return;
             }
         };
+        if let Some(route) = interception {
+            match bridge_verified_tls_with_config(
+                TokioIo::new(upgraded),
+                upstream,
+                &route.host,
+                route.leaf,
+                route.upstream_config,
+                handshake_timeout,
+                lifetime,
+            )
+            .await
+            {
+                Ok(result) => {
+                    exchange.update(|capture| {
+                        capture.request_bytes = result.client_to_upstream_bytes;
+                        capture.response_bytes = result.upstream_to_client_bytes;
+                    });
+                    exchange.finish(None);
+                }
+                Err(_) => exchange.finish(Some("Verified TLS bridge failed.")),
+            }
+            return;
+        }
         let mut client = CountedIo {
             inner: TokioIo::new(upgraded),
             exchange: exchange.clone(),
