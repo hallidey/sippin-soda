@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sippin_soda_engine::{
     BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus,
     ProxyClientAuth, ProxyConfig, ProxyEngine, SearchStep, Snapshot, TlsClientIdentity,
-    TlsTrustCheckManager, TlsTrustCheckStatus,
+    TlsInspectionPreflight, TlsTrustCheckManager, TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -266,6 +266,20 @@ fn tls_trust_check_status(
 }
 
 #[tauri::command]
+async fn tls_inspection_preflight(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+) -> Result<TlsInspectionPreflight, String> {
+    let proxy_status = engine.snapshot().status;
+    let ca = ca.inner().clone();
+    let ca_status = tauri::async_runtime::spawn_blocking(move || ca.status())
+        .await
+        .map_err(|_| "TLS inspection preflight worker failed.".to_string())??;
+    Ok(trust_check.preflight(&ca_status, &proxy_status))
+}
+
+#[tauri::command]
 async fn start_tls_trust_check(
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
@@ -329,6 +343,7 @@ fn main() {
             remove_local_ca,
             export_local_ca,
             tls_trust_check_status,
+            tls_inspection_preflight,
             start_tls_trust_check,
             cancel_tls_trust_check,
             response_body_page,

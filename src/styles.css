@@ -738,6 +738,21 @@ input:focus-visible {
 .proxy-credential p {
   margin: 6px 0;
 }
+.tls-preflight {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.tls-preflight.ready {
+  border-color: var(--accent);
+}
+.tls-preflight.blocked strong {
+  color: var(--muted);
+}
+.tls-preflight p {
+  margin: 4px 0;
+}
 .destination-rules {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

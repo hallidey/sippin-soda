@@ -1,6 +1,6 @@
 use crate::{
-    CaStatus, IssuedLeaf, TlsClientIdentity, TlsInspectionGate, TlsInspectionReadiness,
-    TlsTrustError,
+    CaStatus, EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInspectionGate,
+    TlsInspectionReadiness, TlsReadinessState, TlsTrustError,
 };
 use serde::Serialize;
 use std::{
@@ -29,6 +29,30 @@ pub struct TlsTrustCheckStatus {
     pub expires_at: Option<u64>,
     pub verified_at: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsInspectionPreflightState {
+    ProxyStopped,
+    ClientAuthenticationRequired,
+    Disabled,
+    MissingCa,
+    ExpiredCa,
+    ClientTrustUnverified,
+    ClientMismatch,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsInspectionPreflight {
+    pub state: TlsInspectionPreflightState,
+    pub can_enable_development: bool,
+    pub https_inspection_active: bool,
+    pub client_profile_id: Option<String>,
+    pub verified_client: Option<TlsClientIdentity>,
+    pub proof_expires_at: Option<u64>,
 }
 
 impl TlsTrustCheckStatus {
@@ -73,6 +97,60 @@ impl TlsTrustCheckManager {
             .unwrap()
             .as_ref()
             .map(|gate| gate.readiness(ca, client_id))
+    }
+
+    pub fn preflight(&self, ca: &CaStatus, proxy: &EngineStatus) -> TlsInspectionPreflight {
+        if proxy.phase != EnginePhase::Running {
+            return TlsInspectionPreflight::blocked(
+                TlsInspectionPreflightState::ProxyStopped,
+                None,
+            );
+        }
+        let Some(client_id) = proxy.client_profile_id.as_deref() else {
+            return TlsInspectionPreflight::blocked(
+                TlsInspectionPreflightState::ClientAuthenticationRequired,
+                None,
+            );
+        };
+        if ca.state != "ready" || ca.fingerprint_sha256.is_none() || ca.expires_at.is_none() {
+            return TlsInspectionPreflight::blocked(
+                TlsInspectionPreflightState::MissingCa,
+                Some(client_id),
+            );
+        }
+        if ca
+            .expires_at
+            .is_some_and(|expires| expires <= unix_millis())
+        {
+            return TlsInspectionPreflight::blocked(
+                TlsInspectionPreflightState::ExpiredCa,
+                Some(client_id),
+            );
+        }
+        let Some(readiness) = self.readiness(ca, client_id) else {
+            return TlsInspectionPreflight::blocked(
+                TlsInspectionPreflightState::ClientTrustUnverified,
+                Some(client_id),
+            );
+        };
+        let state = match readiness.state {
+            TlsReadinessState::Disabled => TlsInspectionPreflightState::Disabled,
+            TlsReadinessState::MissingCa => TlsInspectionPreflightState::MissingCa,
+            TlsReadinessState::ExpiredCa => TlsInspectionPreflightState::ExpiredCa,
+            TlsReadinessState::ClientTrustUnverified => {
+                TlsInspectionPreflightState::ClientTrustUnverified
+            }
+            TlsReadinessState::ClientMismatch => TlsInspectionPreflightState::ClientMismatch,
+            TlsReadinessState::Ready => TlsInspectionPreflightState::Ready,
+        };
+        TlsInspectionPreflight {
+            state,
+            can_enable_development: state == TlsInspectionPreflightState::Ready,
+            https_inspection_active: false,
+            client_profile_id: Some(client_id.into()),
+            verified_client: readiness.verified_client,
+            proof_expires_at: readiness.proof_expires_at,
+        }
     }
 
     pub async fn start(
@@ -162,6 +240,19 @@ impl TlsTrustCheckManager {
     }
 }
 
+impl TlsInspectionPreflight {
+    fn blocked(state: TlsInspectionPreflightState, client_id: Option<&str>) -> Self {
+        Self {
+            state,
+            can_enable_development: false,
+            https_inspection_active: false,
+            client_profile_id: client_id.map(String::from),
+            verified_client: None,
+            proof_expires_at: None,
+        }
+    }
+}
+
 enum CheckFailure {
     Expired,
     Rejected,
@@ -246,6 +337,12 @@ mod tests {
             .unwrap();
         assert_eq!(waiting.state, TlsTrustCheckState::Waiting);
         assert_eq!(waiting.client.as_ref(), Some(&identity));
+        assert_eq!(
+            manager
+                .preflight(&ca_status, &EngineStatus::default())
+                .state,
+            TlsInspectionPreflightState::ProxyStopped
+        );
         let socket = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port(&waiting)))
             .await
             .unwrap();
@@ -280,6 +377,37 @@ mod tests {
         assert!(manager
             .readiness(&ca_status, "other-client")
             .is_some_and(|readiness| !readiness.can_inspect_development));
+        let mut proxy = EngineStatus {
+            phase: EnginePhase::Running,
+            ..Default::default()
+        };
+        assert_eq!(
+            manager.preflight(&ca_status, &proxy).state,
+            TlsInspectionPreflightState::ClientAuthenticationRequired
+        );
+        proxy.client_profile_id = Some("other-client".into());
+        assert_eq!(
+            manager.preflight(&ca_status, &proxy).state,
+            TlsInspectionPreflightState::ClientMismatch
+        );
+        proxy.client_profile_id = Some(identity.id().into());
+        let mut missing_ca = ca_status.clone();
+        missing_ca.state = "absent".into();
+        assert_eq!(
+            manager.preflight(&missing_ca, &proxy).state,
+            TlsInspectionPreflightState::MissingCa
+        );
+        let mut expired_ca = ca_status.clone();
+        expired_ca.expires_at = Some(1);
+        assert_eq!(
+            manager.preflight(&expired_ca, &proxy).state,
+            TlsInspectionPreflightState::ExpiredCa
+        );
+        let preflight = manager.preflight(&ca_status, &proxy);
+        assert_eq!(preflight.state, TlsInspectionPreflightState::Ready);
+        assert!(preflight.can_enable_development);
+        assert!(!preflight.https_inspection_active);
+        assert_eq!(preflight.verified_client.as_ref(), Some(&identity));
         assert!(
             tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port(&waiting)))
                 .await

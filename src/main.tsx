@@ -40,6 +40,22 @@ type ProxyCredential = {
   profileId: string;
   token: string;
 };
+type TlsInspectionPreflight = {
+  state:
+    | "proxy_stopped"
+    | "client_authentication_required"
+    | "disabled"
+    | "missing_ca"
+    | "expired_ca"
+    | "client_trust_unverified"
+    | "client_mismatch"
+    | "ready";
+  canEnableDevelopment: boolean;
+  httpsInspectionActive: boolean;
+  clientProfileId: string | null;
+  verifiedClient: TlsClientProfile | null;
+  proofExpiresAt: number | null;
+};
 
 const clientProfilesKey = "sippin-tls-client-profiles";
 
@@ -133,6 +149,8 @@ function App() {
   const [requireClientAuth, setRequireClientAuth] = useState(false);
   const [proxyCredential, setProxyCredential] =
     useState<ProxyCredential | null>(null);
+  const [tlsPreflight, setTlsPreflight] =
+    useState<TlsInspectionPreflight | null>(null);
   const selectedClient =
     clientProfiles.find((profile) => profile.id === selectedClientId) ?? null;
   const activeProxyClient =
@@ -171,6 +189,20 @@ function App() {
     Number(diskBudget) <= 1024;
   const validPort =
     /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+  const preflightMessage: Record<TlsInspectionPreflight["state"], string> = {
+    proxy_stopped: "Start the proxy before evaluating HTTPS inspection.",
+    client_authentication_required:
+      "Start the proxy with client profile authentication.",
+    disabled: "HTTPS inspection has not been explicitly enabled.",
+    missing_ca: "Generate the local development CA first.",
+    expired_ca: "The local development CA has expired.",
+    client_trust_unverified:
+      "Run the trust check with the authenticated client profile.",
+    client_mismatch:
+      "The authenticated proxy profile does not match the verified client.",
+    ready:
+      "Proxy identity and TLS trust proof match. Listener integration is not active yet.",
+  };
 
   const createClientToken = () => {
     const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -222,11 +254,13 @@ function App() {
     void Promise.all([
       invoke<CaStatus>("ca_status"),
       invoke<TlsTrustCheckStatus>("tls_trust_check_status"),
+      invoke<TlsInspectionPreflight>("tls_inspection_preflight"),
     ])
-      .then(([nextCa, nextTrust]) => {
+      .then(([nextCa, nextTrust, nextPreflight]) => {
         if (active) {
           setCaStatus(nextCa);
           setTrustCheck(nextTrust);
+          setTlsPreflight(nextPreflight);
         }
       })
       .catch((cause) => {
@@ -236,6 +270,12 @@ function App() {
       active = false;
     };
   }, [desktop]);
+  useEffect(() => {
+    if (!desktop) return;
+    void invoke<TlsInspectionPreflight>("tls_inspection_preflight")
+      .then(setTlsPreflight)
+      .catch((cause) => setCaMessage(String(cause)));
+  }, [desktop, snapshot?.revision, trustCheck?.state]);
   useEffect(() => {
     if (!desktop || trustCheck?.state !== "waiting") return;
     const timer = window.setInterval(() => {
@@ -511,6 +551,24 @@ function App() {
                   restart the proxy to generate a new credential.
                 </p>
               )}
+              {running && status?.clientProfileId && tlsPreflight && (
+                <div
+                  className={`tls-preflight ${tlsPreflight.canEnableDevelopment ? "ready" : "blocked"}`}
+                  role="status"
+                >
+                  <strong>
+                    HTTPS inspection preflight: {tlsPreflight.state}
+                  </strong>
+                  <p>{preflightMessage[tlsPreflight.state]}</p>
+                  {tlsPreflight.proofExpiresAt && (
+                    <p>
+                      Trust proof expires{" "}
+                      {new Date(tlsPreflight.proofExpiresAt).toLocaleString()}.
+                    </p>
+                  )}
+                  <p>HTTPS inspection active: no.</p>
+                </div>
+              )}
               <label>
                 Session disk budget (GiB){" "}
                 <input
@@ -634,6 +692,12 @@ function App() {
                 {status?.clientProfileId
                   ? `Required · ${status.clientProfileId}`
                   : "Optional · disabled for this proxy run"}
+              </dd>
+              <dt>Inspection preflight</dt>
+              <dd>
+                {tlsPreflight
+                  ? `${tlsPreflight.state} · HTTPS inspection inactive`
+                  : "Unavailable"}
               </dd>
               <dt>Production policy</dt>
               <dd>
