@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Kept in the listener's tracked connection task, never a detached task.
@@ -8,6 +9,8 @@ pub(super) struct Tunnel {
     exchange: Arc<Exchange>,
     interception: Option<TlsInterceptRoute>,
     authority: Authority,
+    destination: DestinationClass,
+    client_profile_id: Option<String>,
 }
 
 pub(super) async fn establish(
@@ -79,6 +82,8 @@ pub(super) async fn establish(
             exchange,
             interception,
             authority,
+            destination,
+            client_profile_id: client_profile_id.map(str::to_owned),
         })
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Proxy is stopping."))?;
     let mut result = response(StatusCode::OK, "");
@@ -94,6 +99,8 @@ impl Tunnel {
             exchange,
             interception,
             authority,
+            destination,
+            client_profile_id,
         } = self;
         let upgraded = match timeout(handshake_timeout, upgrade).await {
             Ok(Ok(io)) => io,
@@ -119,16 +126,45 @@ impl Tunnel {
                     return;
                 }
             };
-            let upstream = Arc::new(Mutex::new(Some(established.upstream)));
+            let (sender, connection) =
+                match hyper::client::conn::http1::handshake(TokioIo::new(established.upstream))
+                    .await
+                {
+                    Ok(parts) => parts,
+                    Err(_) => {
+                        exchange.finish(Some("Upstream HTTPS HTTP/1 handshake failed."));
+                        return;
+                    }
+                };
+            let upstream_connection = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let sender = Arc::new(tokio::sync::Mutex::new(sender));
+            let first_request = Arc::new(AtomicBool::new(true));
             let service_exchange = exchange.clone();
             let service = service_fn(move |request: Request<Incoming>| {
-                let exchange = service_exchange.clone();
-                let upstream = upstream.clone();
+                let exchange = if first_request.swap(false, Ordering::AcqRel) {
+                    service_exchange.clone()
+                } else {
+                    begin_exchange(
+                        service_exchange.shared.clone(),
+                        &request,
+                        destination,
+                        client_profile_id.clone(),
+                    )
+                };
+                let sender = sender.clone();
                 let authority = authority.clone();
                 async move {
-                    let result =
-                        forward_intercepted_https(request, exchange.clone(), upstream, authority)
-                            .await;
+                    let result = timeout(
+                        handshake_timeout,
+                        forward_intercepted_https(request, exchange.clone(), sender, authority),
+                    )
+                    .await
+                    .unwrap_or(Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Upstream HTTPS request timed out.",
+                    )));
                     Ok::<_, Infallible>(match result {
                         Ok(response) => response,
                         Err((status, message)) => {
@@ -141,7 +177,7 @@ impl Tunnel {
             });
             let mut builder = http1::Builder::new();
             builder
-                .keep_alive(false)
+                .keep_alive(true)
                 .max_buf_size(32 * 1024)
                 .timer(TokioTimer::new())
                 .header_read_timeout(handshake_timeout);
@@ -157,6 +193,7 @@ impl Tunnel {
                 Ok(Err(_)) => exchange.finish(Some("Inner HTTPS HTTP/1 transfer failed.")),
                 Err(_) => exchange.finish(Some("Tunnel lifetime limit reached.")),
             }
+            upstream_connection.abort();
             return;
         }
         let mut client = CountedIo {
@@ -182,15 +219,12 @@ impl Tunnel {
     }
 }
 
-async fn forward_intercepted_https<U>(
+async fn forward_intercepted_https(
     request: Request<Incoming>,
     exchange: Arc<Exchange>,
-    upstream: Arc<Mutex<Option<U>>>,
+    sender: Arc<tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<RequestBody>>>,
     authority: Authority,
-) -> Result<Response<WireBody>, ForwardError>
-where
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> Result<Response<WireBody>, ForwardError> {
     if request.headers().contains_key("upgrade") {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
@@ -222,11 +256,8 @@ where
         capture.response_headers.clear();
     });
     exchange.shared.lock().unwrap().revision += 1;
-    let stream = upstream.lock().unwrap().take().ok_or((
-        StatusCode::BAD_GATEWAY,
-        "Only one HTTP/1 request is supported per inspected CONNECT tunnel.",
-    ))?;
-    forward_connected(request, exchange, stream, authority).await
+    let mut sender = sender.lock().await;
+    forward_with_sender(request, exchange, &mut sender, authority, None).await
 }
 
 /// Count bytes accepted by the opposite transport, without retaining payload.

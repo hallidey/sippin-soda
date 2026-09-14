@@ -1063,53 +1063,12 @@ async fn handle(
             .destination_classifier
             .classify(request.uri().host().unwrap_or(""))
     };
-    let exchange = {
-        let mut state = shared.lock().unwrap();
-        let id = state.next_id;
-        state.next_id += 1;
-        if state.traffic.len() == state.limit {
-            if let Some(capture) = state.traffic.pop_front() {
-                state.request_bodies.remove(capture.id);
-                state.response_bodies.remove(capture.id);
-            }
-            state.status.evicted_captures += 1;
-        }
-        state.traffic.push_back(Capture {
-            id,
-            kind: if request.method() == Method::CONNECT {
-                "tunnel"
-            } else {
-                "http"
-            }
-            .into(),
-            method: request.method().to_string(),
-            target: safe_target(&request),
-            destination_class,
-            client_profile_id: client_profile_id.clone(),
-            started_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            status: None,
-            phase: "pending".into(),
-            duration_ms: 0,
-            request_bytes: 0,
-            response_bytes: 0,
-            request_headers: safe_headers(request.headers()),
-            response_headers: vec![],
-            error: None,
-            request_body_state: "disabled".into(),
-            request_body_error: None,
-            response_body_error: None,
-        });
-        state.status.captures = state.traffic.len();
-        state.revision += 1;
-        Arc::new(Exchange {
-            shared: shared.clone(),
-            id,
-            started: Instant::now(),
-        })
-    };
+    let exchange = begin_exchange(
+        shared,
+        &request,
+        destination_class,
+        client_profile_id.clone(),
+    );
     let operation = async {
         if request.method() == Method::CONNECT {
             tunnel::establish(
@@ -1141,6 +1100,60 @@ async fn handle(
         }
     };
     Ok(result)
+}
+
+fn begin_exchange(
+    shared: Shared,
+    request: &Request<Incoming>,
+    destination_class: DestinationClass,
+    client_profile_id: Option<String>,
+) -> Arc<Exchange> {
+    let mut state = shared.lock().unwrap();
+    let id = state.next_id;
+    state.next_id += 1;
+    if state.traffic.len() == state.limit {
+        if let Some(capture) = state.traffic.pop_front() {
+            state.request_bodies.remove(capture.id);
+            state.response_bodies.remove(capture.id);
+        }
+        state.status.evicted_captures += 1;
+    }
+    state.traffic.push_back(Capture {
+        id,
+        kind: if request.method() == Method::CONNECT {
+            "tunnel"
+        } else {
+            "http"
+        }
+        .into(),
+        method: request.method().to_string(),
+        target: safe_target(request),
+        destination_class,
+        client_profile_id,
+        started_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        status: None,
+        phase: "pending".into(),
+        duration_ms: 0,
+        request_bytes: 0,
+        response_bytes: 0,
+        request_headers: safe_headers(request.headers()),
+        response_headers: vec![],
+        error: None,
+        request_body_state: "disabled".into(),
+        request_body_error: None,
+        response_body_error: None,
+    });
+    state.status.captures = state.traffic.len();
+    state.revision += 1;
+    drop(state);
+    Arc::new(Exchange {
+        shared,
+        id,
+        started: Instant::now(),
+    })
 }
 
 type ForwardError = (StatusCode, &'static str);
@@ -1182,7 +1195,7 @@ async fn forward(
 }
 
 async fn forward_connected<S>(
-    mut request: Request<Incoming>,
+    request: Request<Incoming>,
     exchange: Arc<Exchange>,
     stream: S,
     authority: Authority,
@@ -1193,6 +1206,26 @@ where
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP handshake failed."))?;
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    forward_with_sender(
+        request,
+        exchange,
+        &mut sender,
+        authority,
+        Some(ConnectionGuard(connection)),
+    )
+    .await
+}
+
+async fn forward_with_sender(
+    mut request: Request<Incoming>,
+    exchange: Arc<Exchange>,
+    sender: &mut hyper::client::conn::http1::SendRequest<RequestBody>,
+    authority: Authority,
+    connection: Option<ConnectionGuard>,
+) -> Result<Response<WireBody>, ForwardError> {
     let path = request
         .uri()
         .path_and_query()
@@ -1250,10 +1283,6 @@ where
             redaction_paths: request_redaction_paths,
         },
     );
-    let connection = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let guard = ConnectionGuard(connection);
     let upstream = sender
         .send_request(request)
         .await
@@ -1329,7 +1358,7 @@ where
             pending: None,
             written: 0,
         },
-        _connection: guard,
+        _connection: connection,
     };
     Ok(Response::from_parts(parts, body.boxed()))
 }
@@ -1372,7 +1401,7 @@ impl Drop for ConnectionGuard {
 
 struct ResponseBody {
     observed: RecordedBody,
-    _connection: ConnectionGuard,
+    _connection: Option<ConnectionGuard>,
 }
 impl Body for ResponseBody {
     type Data = Bytes;
@@ -1483,6 +1512,31 @@ mod tls_listener_tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    async fn http_message<S: AsyncRead + Unpin>(stream: &mut S) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            bytes.push(stream.read_u8().await.unwrap());
+        }
+        let headers_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = String::from_utf8(bytes[..headers_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        bytes.resize(headers_end + content_length, 0);
+        stream.read_exact(&mut bytes[headers_end..]).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
     #[tokio::test]
     async fn authenticated_development_connect_captures_inner_http_safely() {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -1512,35 +1566,24 @@ mod tls_listener_tests {
                 .accept(socket)
                 .await
                 .unwrap();
-            let mut request = Vec::new();
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                request.push(tls.read_u8().await.unwrap());
-            }
-            let headers_end = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let headers = String::from_utf8(request[..headers_end].to_vec()).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .and_then(|value| value.parse::<usize>().ok())
-                })
-                .unwrap();
-            request.resize(headers_end + content_length, 0);
-            tls.read_exact(&mut request[headers_end..]).await.unwrap();
-            let request = String::from_utf8(request).unwrap();
+            let request = http_message(&mut tls).await;
             assert!(request.starts_with("POST /submit?token=secret HTTP/1.1\r\n"));
             let lowercase_request = request.to_ascii_lowercase();
             assert!(lowercase_request.contains(&format!("host: 127.0.0.1:{upstream_port}\r\n")));
             assert!(!lowercase_request.contains("proxy-authorization"));
             assert!(request.contains(r#"{"password":"secret","value":"safe"}"#));
             tls.write_all(
-                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+            let request = http_message(&mut tls).await;
+            assert!(request.starts_with("GET /second?key=secret HTTP/1.1\r\n"));
+            let lowercase_request = request.to_ascii_lowercase();
+            assert!(lowercase_request.contains(&format!("host: 127.0.0.1:{upstream_port}\r\n")));
+            assert!(!lowercase_request.contains("proxy-authorization"));
+            tls.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"sequence\":2}",
             )
             .await
             .unwrap();
@@ -1594,7 +1637,7 @@ mod tls_listener_tests {
         let body = r#"{"password":"secret","value":"safe"}"#;
         tls.write_all(
             format!(
-                "POST /submit?token=secret HTTP/1.1\r\nHost: wrong.example\r\nAuthorization: Bearer inner-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST /submit?token=secret HTTP/1.1\r\nHost: wrong.example\r\nAuthorization: Bearer inner-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -1602,16 +1645,26 @@ mod tls_listener_tests {
         .await
         .unwrap();
         tls.flush().await.unwrap();
-        let mut reply = Vec::new();
-        tls.read_to_end(&mut reply).await.unwrap();
-        let reply = String::from_utf8(reply).unwrap();
+        let reply = http_message(&mut tls).await;
         assert!(reply.starts_with("HTTP/1.1 201 Created"));
         assert!(reply.ends_with(r#"{"ok":true}"#));
+        tls.write_all(
+            b"GET /second?key=secret HTTP/1.1\r\nHost: another-wrong.example\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        let reply = http_message(&mut tls).await;
+        assert!(reply.starts_with("HTTP/1.1 202 Accepted"));
+        assert!(reply.ends_with(r#"{"sequence":2}"#));
         upstream.await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while {
-                let capture = &engine.snapshot().traffic[0];
-                capture.phase == "pending" || capture.request_body_state == "recording"
+                let snapshot = engine.snapshot();
+                snapshot.traffic.len() != 2
+                    || snapshot.traffic.iter().any(|capture| {
+                        capture.phase == "pending" || capture.request_body_state == "recording"
+                    })
             } {
                 tokio::task::yield_now().await;
             }
@@ -1619,25 +1672,32 @@ mod tls_listener_tests {
         .await
         .unwrap();
         let snapshot = engine.snapshot();
-        let capture_id = snapshot.traffic[0].id;
-        let request_body = engine.request_body_page(capture_id, 0, 1024).await.unwrap();
+        let first_capture_id = snapshot.traffic[1].id;
+        let request_body = engine
+            .request_body_page(first_capture_id, 0, 1024)
+            .await
+            .unwrap();
         let response_body = engine
-            .response_body_page(capture_id, 0, 1024)
+            .response_body_page(first_capture_id, 0, 1024)
+            .await
+            .unwrap();
+        let second_response_body = engine
+            .response_body_page(snapshot.traffic[0].id, 0, 1024)
             .await
             .unwrap();
         let snapshot = engine.stop().await;
         assert!(!snapshot.status.https_inspection);
-        let capture = &snapshot.traffic[0];
-        assert_eq!(capture.kind, "https");
-        assert_eq!(capture.method, "POST");
+        let first = &snapshot.traffic[1];
+        assert_eq!(first.kind, "https");
+        assert_eq!(first.method, "POST");
         assert_eq!(
-            capture.target,
+            first.target,
             format!("127.0.0.1:{upstream_port}/submit?[REDACTED]")
         );
-        assert_eq!(capture.status, Some(201));
-        assert_eq!(capture.request_bytes, body.len() as u64);
-        assert_eq!(capture.response_bytes, 11);
-        assert!(capture
+        assert_eq!(first.status, Some(201));
+        assert_eq!(first.request_bytes, body.len() as u64);
+        assert_eq!(first.response_bytes, 11);
+        assert!(first
             .request_headers
             .iter()
             .any(|(name, value)| name == "authorization" && value == "[REDACTED]"));
@@ -1649,7 +1709,21 @@ mod tls_listener_tests {
             String::from_utf8(response_body.bytes).unwrap(),
             r#"{"ok":true}"#
         );
-        assert_eq!(capture.phase, "complete");
+        assert_eq!(first.phase, "complete");
+        let second = &snapshot.traffic[0];
+        assert_eq!(second.kind, "https");
+        assert_eq!(second.method, "GET");
+        assert_eq!(
+            second.target,
+            format!("127.0.0.1:{upstream_port}/second?[REDACTED]")
+        );
+        assert_eq!(second.status, Some(202));
+        assert_eq!(second.response_bytes, 14);
+        assert_eq!(
+            String::from_utf8(second_response_body.bytes).unwrap(),
+            r#"{"sequence":2}"#
+        );
+        assert_eq!(second.phase, "complete");
     }
 
     #[tokio::test]

@@ -62,7 +62,7 @@ export function Traffic({
           HTTP metadata + optional body inspection · JSON requests are redacted
           before storage ·{" "}
           {snapshot?.status.httpsInspection
-            ? "Development TLS termination and one-request HTTP/1 capture are enabled."
+            ? "Development TLS termination and persistent HTTP/1 capture are enabled."
             : "HTTPS content stays in opaque tunnels; the CA is never installed automatically."}
         </p>
       </div>
