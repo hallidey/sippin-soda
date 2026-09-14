@@ -391,6 +391,27 @@ select {
   display: block;
   margin-top: 16px;
 }
+.trust-check-panel {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.trust-check-panel h3 {
+  margin: 0 0 8px;
+}
+.trust-check-url {
+  display: block;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.trust-check-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 dl {
   display: grid;
   grid-template-columns: 180px 1fr;

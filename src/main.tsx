@@ -24,6 +24,13 @@ type CaStatus = {
   installedByApp: boolean;
   httpsInspection: boolean;
 };
+type TlsTrustCheckStatus = {
+  state: "idle" | "waiting" | "verified" | "failed" | "expired";
+  url: string | null;
+  expiresAt: number | null;
+  verifiedAt: number | null;
+  error: string | null;
+};
 const descriptions: Record<Section, string> = {
   Traffic: "Your application’s traffic, in one place.",
   Collections: "Compose requests and keep repeatable workflows together.",
@@ -84,6 +91,11 @@ function App() {
   const [caRemoveConfirmed, setCaRemoveConfirmed] = useState(false);
   const [caBusy, setCaBusy] = useState(false);
   const [caMessage, setCaMessage] = useState("");
+  const [trustCheck, setTrustCheck] = useState<TlsTrustCheckStatus | null>(
+    null,
+  );
+  const [trustCheckConsent, setTrustCheckConsent] = useState(false);
+  const [trustCheckBusy, setTrustCheckBusy] = useState(false);
   const parseHostRules = (value: string) =>
     value
       .split(/[\n,]/)
@@ -94,7 +106,8 @@ function App() {
   const hostRuleIsPlausible = (host: string) =>
     host.length <= 253 &&
     /^[\x21-\x7e]+$/.test(host) &&
-    (!host.includes("*") || (host.startsWith("*.") && !host.slice(2).includes("*")));
+    (!host.includes("*") ||
+      (host.startsWith("*.") && !host.slice(2).includes("*")));
   const validHostRules =
     parsedDevelopmentHosts.length <= 128 &&
     parsedProductionHosts.length <= 128 &&
@@ -124,9 +137,15 @@ function App() {
   useEffect(() => {
     if (!desktop) return;
     let active = true;
-    void invoke<CaStatus>("ca_status")
-      .then((next) => {
-        if (active) setCaStatus(next);
+    void Promise.all([
+      invoke<CaStatus>("ca_status"),
+      invoke<TlsTrustCheckStatus>("tls_trust_check_status"),
+    ])
+      .then(([nextCa, nextTrust]) => {
+        if (active) {
+          setCaStatus(nextCa);
+          setTrustCheck(nextTrust);
+        }
       })
       .catch((cause) => {
         if (active) setCaMessage(String(cause));
@@ -135,6 +154,15 @@ function App() {
       active = false;
     };
   }, [desktop]);
+  useEffect(() => {
+    if (!desktop || trustCheck?.state !== "waiting") return;
+    const timer = window.setInterval(() => {
+      void invoke<TlsTrustCheckStatus>("tls_trust_check_status")
+        .then(setTrustCheck)
+        .catch((cause) => setCaMessage(String(cause)));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [desktop, trustCheck?.state]);
   const caCommand = async (
     name: "generate_local_ca" | "remove_local_ca",
     args: Record<string, unknown>,
@@ -146,6 +174,8 @@ function App() {
       setCaStatus(next);
       setCaConsent(false);
       setCaRemoveConfirmed(false);
+      setTrustCheck(null);
+      setTrustCheckConsent(false);
       setCaMessage(
         next.state === "ready"
           ? "Local CA generated in the operating-system credential store. It has not been installed or trusted."
@@ -157,13 +187,43 @@ function App() {
       setCaBusy(false);
     }
   };
+  const trustCheckCommand = async (
+    name: "start_tls_trust_check" | "cancel_tls_trust_check",
+  ) => {
+    setTrustCheckBusy(true);
+    setCaMessage("");
+    try {
+      const next = await invoke<TlsTrustCheckStatus>(name);
+      setTrustCheck(next);
+      setTrustCheckConsent(false);
+    } catch (cause) {
+      setCaMessage(String(cause));
+    } finally {
+      setTrustCheckBusy(false);
+    }
+  };
+  const copyTrustCheckUrl = async () => {
+    if (!trustCheck?.url) return;
+    try {
+      await navigator.clipboard.writeText(trustCheck.url);
+      setCaMessage(
+        "Temporary trust-check URL copied. Open it in the client you want to verify.",
+      );
+    } catch {
+      setCaMessage(
+        "Copy failed. Select the temporary URL and copy it manually.",
+      );
+    }
+  };
   const exportCa = async () => {
     setCaBusy(true);
     setCaMessage("");
     try {
       const path = await invoke<string | null>("export_local_ca");
       setCaMessage(
-        path ? `Public CA certificate exported to ${path}` : "Export cancelled.",
+        path
+          ? `Public CA certificate exported to ${path}`
+          : "Export cancelled.",
       );
     } catch (cause) {
       setCaMessage(String(cause));
@@ -334,7 +394,9 @@ function App() {
                     disabled={running || busy || !desktop}
                     aria-invalid={!validHostRules}
                     placeholder={"api.dev.example\n*.internal"}
-                    onChange={(event) => setDevelopmentHosts(event.target.value)}
+                    onChange={(event) =>
+                      setDevelopmentHosts(event.target.value)
+                    }
                   />
                 </label>
                 <label className="redaction-paths">
@@ -362,13 +424,13 @@ function App() {
                 Unknown, and Development/Production overlaps are rejected.
               </p>
               <p>
-                Responses have no per-body size cap and remain unredacted.
-                JSON requests up to 1 MiB are redacted before temporary-disk
-                storage; built-in secret keys are always protected and these
-                additional paths support * for array/object members. Other
-                request formats are not recorded. Body files are read in 64 KiB
-                pages and are not encrypted at rest. Clear, eviction and normal
-                app exit remove them; Stop keeps them available.
+                Responses have no per-body size cap and remain unredacted. JSON
+                requests up to 1 MiB are redacted before temporary-disk storage;
+                built-in secret keys are always protected and these additional
+                paths support * for array/object members. Other request formats
+                are not recorded. Body files are read in 64 KiB pages and are
+                not encrypted at rest. Clear, eviction and normal app exit
+                remove them; Stop keeps them available.
               </p>
             </div>
             <Traffic
@@ -422,9 +484,10 @@ function App() {
             <div className="settings-divider" />
             <h2>HTTPS inspection foundation</h2>
             <p>
-              Generate an installation-specific development CA in your operating-system
-              credential store. This does not install or trust the certificate, change
-              system proxy settings, or enable HTTPS interception.
+              Generate an installation-specific development CA in your
+              operating-system credential store. This does not install or trust
+              the certificate, change system proxy settings, or enable HTTPS
+              interception.
             </p>
             {caStatus?.state === "ready" ? (
               <div className="ca-panel">
@@ -449,6 +512,87 @@ function App() {
                 <button disabled={caBusy} onClick={() => void exportCa()}>
                   Export public certificate
                 </button>
+                <div className="trust-check-panel">
+                  <h3>Verify client trust</h3>
+                  <p>
+                    Run a one-time local endpoint, then open its URL in the same
+                    browser or runtime that will use the proxy. This verifies
+                    only that client and does not enable HTTPS inspection.
+                  </p>
+                  {trustCheck?.state === "waiting" ? (
+                    <>
+                      <code className="trust-check-url">{trustCheck.url}</code>
+                      <p>
+                        Expires at{" "}
+                        {trustCheck.expiresAt
+                          ? new Date(trustCheck.expiresAt).toLocaleTimeString()
+                          : "soon"}
+                        .
+                      </p>
+                      <div className="trust-check-actions">
+                        <button
+                          disabled={trustCheckBusy}
+                          onClick={() => void copyTrustCheckUrl()}
+                        >
+                          Copy temporary URL
+                        </button>
+                        <button
+                          disabled={trustCheckBusy}
+                          onClick={() =>
+                            void trustCheckCommand("cancel_tls_trust_check")
+                          }
+                        >
+                          Cancel check
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      {trustCheck?.state === "verified" && (
+                        <p role="status">
+                          Trust verified for this client
+                          {trustCheck.verifiedAt
+                            ? ` at ${new Date(trustCheck.verifiedAt).toLocaleTimeString()}`
+                            : ""}
+                          {trustCheck.expiresAt
+                            ? `; proof expires ${new Date(trustCheck.expiresAt).toLocaleString()}`
+                            : ""}
+                          . HTTPS inspection remains disabled.
+                        </p>
+                      )}
+                      {(trustCheck?.state === "failed" ||
+                        trustCheck?.state === "expired") && (
+                        <p className="error" role="alert">
+                          {trustCheck.error}
+                        </p>
+                      )}
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={trustCheckConsent}
+                          disabled={caBusy || trustCheckBusy}
+                          onChange={(event) =>
+                            setTrustCheckConsent(event.target.checked)
+                          }
+                        />{" "}
+                        Start a 60-second loopback trust check. No certificate
+                        or proxy setting will be installed or changed.
+                      </label>
+                      <button
+                        disabled={
+                          caBusy || trustCheckBusy || !trustCheckConsent
+                        }
+                        onClick={() =>
+                          void trustCheckCommand("start_tls_trust_check")
+                        }
+                      >
+                        {trustCheckBusy
+                          ? "Starting…"
+                          : "Start local trust check"}
+                      </button>
+                    </>
+                  )}
+                </div>
                 <label className="danger-confirmation">
                   <input
                     type="checkbox"
@@ -458,7 +602,8 @@ function App() {
                       setCaRemoveConfirmed(event.target.checked)
                     }
                   />{" "}
-                  Remove the private key and certificate from credential storage.
+                  Remove the private key and certificate from credential
+                  storage.
                 </label>
                 <button
                   disabled={caBusy || !caRemoveConfirmed}
@@ -478,8 +623,9 @@ function App() {
                     disabled={!desktop || caBusy}
                     onChange={(event) => setCaConsent(event.target.checked)}
                   />{" "}
-                  I consent to generating a local CA private key in my operating-system
-                  credential store. Nothing will be installed into a trust store.
+                  I consent to generating a local CA private key in my
+                  operating-system credential store. Nothing will be installed
+                  into a trust store.
                 </label>
                 <button
                   disabled={!desktop || caBusy || !caConsent}

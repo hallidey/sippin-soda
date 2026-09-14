@@ -2,8 +2,8 @@
 
 use serde::Serialize;
 use sippin_soda_engine::{
-    BodyExportPreview, BodyPage, CaManager, CaStatus, JsonStatus, ProxyConfig, ProxyEngine,
-    SearchStep, Snapshot,
+    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus, ProxyConfig,
+    ProxyEngine, SearchStep, Snapshot, TlsTrustCheckManager, TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -193,8 +193,10 @@ async fn ca_status(ca: tauri::State<'_, Arc<CaManager>>) -> Result<CaStatus, Str
 #[tauri::command]
 async fn generate_local_ca(
     ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     consent: bool,
 ) -> Result<CaStatus, String> {
+    trust_check.cancel().await;
     let ca = ca.inner().clone();
     tauri::async_runtime::spawn_blocking(move || ca.generate(consent))
         .await
@@ -204,8 +206,10 @@ async fn generate_local_ca(
 #[tauri::command]
 async fn remove_local_ca(
     ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     confirmed: bool,
 ) -> Result<CaStatus, String> {
+    trust_check.cancel().await;
     let ca = ca.inner().clone();
     tauri::async_runtime::spawn_blocking(move || ca.remove(confirmed))
         .await
@@ -239,11 +243,40 @@ async fn export_local_ca(
     Ok(Some(destination.to_string_lossy().into_owned()))
 }
 
+#[tauri::command]
+fn tls_trust_check_status(
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+) -> TlsTrustCheckStatus {
+    trust_check.status()
+}
+
+#[tauri::command]
+async fn start_tls_trust_check(
+    ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+) -> Result<TlsTrustCheckStatus, String> {
+    let ca = ca.inner().clone();
+    let leaf = tauri::async_runtime::spawn_blocking(move || {
+        ca.issue_leaf("localhost", DestinationClass::Development)
+    })
+    .await
+    .map_err(|_| "TLS trust-check certificate worker failed.".to_string())??;
+    trust_check.start(leaf, Duration::from_secs(60)).await
+}
+
+#[tauri::command]
+async fn cancel_tls_trust_check(
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+) -> Result<TlsTrustCheckStatus, String> {
+    Ok(trust_check.cancel().await)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(ProxyEngine::default()))
         .manage(Arc::new(CaManager::default()))
+        .manage(Arc::new(TlsTrustCheckManager::default()))
         .setup(|app| {
             let handle = app.handle().clone();
             let engine = app.state::<Arc<ProxyEngine>>().inner().clone();
@@ -275,6 +308,9 @@ fn main() {
             generate_local_ca,
             remove_local_ca,
             export_local_ca,
+            tls_trust_check_status,
+            start_tls_trust_check,
+            cancel_tls_trust_check,
             response_body_page,
             search_response_body,
             response_json_view,
@@ -285,7 +321,9 @@ fn main() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 let engine = app.state::<Arc<ProxyEngine>>();
+                let trust_check = app.state::<Arc<TlsTrustCheckManager>>();
                 tauri::async_runtime::block_on(engine.stop());
+                tauri::async_runtime::block_on(trust_check.cancel());
                 engine.clear();
             }
         });

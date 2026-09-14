@@ -2,11 +2,13 @@
 mod ca;
 mod proxy;
 mod tls_intercept;
+mod tls_trust_check;
 pub use ca::*;
 pub use proxy::*;
 use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub use tls_intercept::*;
+pub use tls_trust_check::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
