@@ -30,11 +30,20 @@ export function Traffic({
   busy: boolean;
   proxyCredential: { profileId: string; token: string } | null;
   clear: () => void;
-  resolveBreakpoint: (id: number, status: number | null) => void;
+  resolveBreakpoint: (
+    id: number,
+    status: number | null,
+    body?: string | null,
+    contentType?: string | null,
+  ) => void;
 }) {
   const [query, setQuery] = useState("");
   const [selectedId, select] = useState<number | null>(null);
   const [tab, setTab] = useState("Request");
+  const [replacementStatus, setReplacementStatus] = useState("200");
+  const [replacementContentType, setReplacementContentType] =
+    useState("application/json");
+  const [replacementBody, setReplacementBody] = useState('{\n  "ok": true\n}');
   const traffic = snapshot?.traffic ?? [];
   const selected = traffic.find((capture) => capture.id === selectedId);
   const filtered = traffic.filter((capture) =>
@@ -252,6 +261,60 @@ export function Traffic({
                 >
                   Return 503
                 </button>
+                <div className="breakpoint-replacement">
+                  <label>
+                    Status
+                    <input
+                      type="number"
+                      min="200"
+                      max="599"
+                      value={replacementStatus}
+                      onChange={(event) =>
+                        setReplacementStatus(event.target.value)
+                      }
+                    />
+                  </label>
+                  <label>
+                    Content-Type
+                    <input
+                      value={replacementContentType}
+                      maxLength={128}
+                      onChange={(event) =>
+                        setReplacementContentType(event.target.value)
+                      }
+                    />
+                  </label>
+                  <label>
+                    Replacement body (max 64 KiB UTF-8)
+                    <textarea
+                      rows={6}
+                      value={replacementBody}
+                      onChange={(event) =>
+                        setReplacementBody(event.target.value)
+                      }
+                    />
+                  </label>
+                  <button
+                    onClick={() =>
+                      resolveBreakpoint(
+                        selected.id,
+                        Number(replacementStatus),
+                        replacementBody,
+                        replacementContentType,
+                      )
+                    }
+                    disabled={
+                      busy ||
+                      Number(replacementStatus) < 200 ||
+                      Number(replacementStatus) > 599 ||
+                      new TextEncoder().encode(replacementBody).length >
+                        65536 ||
+                      !replacementContentType.trim()
+                    }
+                  >
+                    Return replacement
+                  </button>
+                </div>
               </div>
             )}
             {tab === "Request" ? (

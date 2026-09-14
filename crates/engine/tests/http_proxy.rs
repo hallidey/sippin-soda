@@ -95,20 +95,89 @@ async fn development_response_breakpoint_can_override_status_once() {
     assert_eq!(capture.original_status, Some(201));
     assert!(!request.is_finished());
     engine
-        .resolve_response_breakpoint(capture.id, Some(503))
+        .resolve_response_breakpoint(capture.id, Some(503), None, None)
         .unwrap();
     let reply = request.await.unwrap();
     assert!(reply.starts_with("HTTP/1.1 503"));
     assert!(reply.ends_with("hello"));
     assert!(engine
-        .resolve_response_breakpoint(capture.id, None)
+        .resolve_response_breakpoint(capture.id, None, None, None)
         .is_err());
     assert!(engine
-        .resolve_response_breakpoint(capture.id, Some(199))
+        .resolve_response_breakpoint(capture.id, Some(199), None, None)
         .is_err());
     let snapshot = engine.stop().await;
     assert_eq!(snapshot.traffic[0].status, Some(503));
     assert_eq!(snapshot.traffic[0].breakpoint_state, "modified");
+}
+
+#[tokio::test]
+async fn development_response_breakpoint_can_replace_a_bounded_body() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\nETag: old\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let engine = Arc::new(ProxyEngine::default());
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            break_on_responses: true,
+            capture_bodies: true,
+            body_disk_budget: 1024 * 1024,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let request = tokio::spawn(send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/mock HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    ));
+    let capture = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot
+                .traffic
+                .first()
+                .is_some_and(|capture| capture.breakpoint_state == "waiting")
+            {
+                break snapshot.traffic[0].clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    engine
+        .resolve_response_breakpoint(
+            capture.id,
+            Some(202),
+            Some("{\"mock\":true}".into()),
+            Some("application/json".into()),
+        )
+        .unwrap();
+    let reply = request.await.unwrap();
+    assert!(reply.starts_with("HTTP/1.1 202"));
+    assert!(reply
+        .to_lowercase()
+        .contains("content-type: application/json"));
+    assert!(reply.to_lowercase().contains("content-length: 13"));
+    assert!(!reply.to_lowercase().contains("content-encoding"));
+    assert!(!reply.to_lowercase().contains("etag:"));
+    assert!(reply.ends_with("{\"mock\":true}"));
+    let page = engine.response_body_page(capture.id, 0, 64).await.unwrap();
+    assert_eq!(page.bytes, b"{\"mock\":true}");
+    assert_eq!(page.state, "complete");
+    assert_eq!(engine.snapshot().traffic[0].response_bytes, 13);
+    assert!(engine
+        .resolve_response_breakpoint(
+            capture.id,
+            Some(200),
+            Some("x".repeat(65_537)),
+            Some("text/plain".into()),
+        )
+        .is_err());
+    engine.stop().await;
 }
 
 #[tokio::test]

@@ -711,8 +711,18 @@ function App() {
               busy={busy}
               proxyCredential={proxyCredential}
               clear={() => void command("clear_traffic")}
-              resolveBreakpoint={(id, status) =>
-                void command("resolve_response_breakpoint", { id, status })
+              resolveBreakpoint={(
+                id,
+                status,
+                body = null,
+                contentType = null,
+              ) =>
+                void command("resolve_response_breakpoint", {
+                  id,
+                  status,
+                  body,
+                  contentType,
+                })
               }
             />
           </>

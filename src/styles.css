@@ -696,6 +696,29 @@ input:focus-visible {
 .capture-notice {
   margin: 0 32px 10px;
 }
+.breakpoint-replacement {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.breakpoint-replacement label {
+  display: grid;
+  gap: 4px;
+}
+.breakpoint-replacement input,
+.breakpoint-replacement textarea {
+  box-sizing: border-box;
+  width: min(560px, 100%);
+}
+.breakpoint-replacement input[type="number"] {
+  width: 100px;
+}
+.breakpoint-replacement textarea {
+  resize: vertical;
+  font-family: Consolas, monospace;
+}
 /* Body data is paged: the DOM never holds the entire response. */
 .body-options,
 .body-view {

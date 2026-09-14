@@ -434,7 +434,13 @@ struct State {
     request_redaction_paths: Vec<Vec<String>>,
     destination_classifier: DestinationClassifier,
     break_on_responses: bool,
-    breakpoints: HashMap<u64, oneshot::Sender<Option<StatusCode>>>,
+    breakpoints: HashMap<u64, oneshot::Sender<BreakpointDecision>>,
+}
+
+struct BreakpointDecision {
+    status: Option<StatusCode>,
+    body: Option<Bytes>,
+    content_type: Option<HeaderValue>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -480,6 +486,8 @@ impl ProxyEngine {
         &self,
         id: u64,
         status: Option<u16>,
+        body: Option<String>,
+        content_type: Option<String>,
     ) -> Result<Snapshot, String> {
         let status = status
             .map(|value| {
@@ -494,6 +502,22 @@ impl ProxyEngine {
                     .ok_or("Replacement status must be between 200 and 599.")
             })
             .transpose()?;
+        let body = body.map(Bytes::from);
+        if body.as_ref().is_some_and(|body| body.len() > 64 * 1024) {
+            return Err("Replacement body must be at most 65536 UTF-8 bytes.".into());
+        }
+        if content_type.is_some() && body.is_none() {
+            return Err("Content-Type can be replaced only with a replacement body.".into());
+        }
+        let content_type = content_type
+            .map(|value| {
+                if value.trim().is_empty() || value.len() > 128 || value.contains(['\r', '\n']) {
+                    return Err("Replacement Content-Type is invalid or longer than 128 bytes.");
+                }
+                HeaderValue::from_str(value.trim())
+                    .map_err(|_| "Replacement Content-Type is invalid or longer than 128 bytes.")
+            })
+            .transpose()?;
         let sender = self
             .shared
             .lock()
@@ -502,7 +526,11 @@ impl ProxyEngine {
             .remove(&id)
             .ok_or("Response breakpoint is no longer waiting.")?;
         sender
-            .send(status)
+            .send(BreakpointDecision {
+                status,
+                body,
+                content_type,
+            })
             .map_err(|_| "Response breakpoint closed.".to_string())?;
         Ok(self.snapshot())
     }
@@ -1360,6 +1388,7 @@ async fn forward_with_sender(
             redaction_paths: request_redaction_paths,
         },
     );
+    let upstream_http2 = sender.is_http2();
     let upstream = sender
         .send_request(request)
         .await
@@ -1392,6 +1421,7 @@ async fn forward_with_sender(
             None
         }
     };
+    let mut replacement_body = None;
     if let Some(receiver) = breakpoint {
         let decision = timeout(Duration::from_secs(15), receiver).await;
         exchange
@@ -1401,16 +1431,76 @@ async fn forward_with_sender(
             .breakpoints
             .remove(&exchange.id);
         match decision {
-            Ok(Ok(Some(status))) => {
-                parts.status = status;
-                exchange.update(|capture| capture.breakpoint_state = "modified".into());
-            }
-            Ok(Ok(None)) => {
-                exchange.update(|capture| capture.breakpoint_state = "continued".into())
+            Ok(Ok(decision)) => {
+                if let Some(status) = decision.status {
+                    parts.status = status;
+                }
+                replacement_body = decision.body.map(|body| (body, decision.content_type));
+                let modified = decision.status.is_some() || replacement_body.is_some();
+                exchange.update(|capture| {
+                    capture.breakpoint_state =
+                        if modified { "modified" } else { "continued" }.into()
+                });
             }
             _ => exchange.update(|capture| capture.breakpoint_state = "timed_out".into()),
         }
         exchange.shared.lock().unwrap().revision += 1;
+    }
+    if let Some((replacement, content_type)) = replacement_body {
+        strip_hop_headers(&mut parts.headers);
+        for name in [
+            "content-encoding",
+            "content-range",
+            "etag",
+            "content-md5",
+            "accept-ranges",
+        ] {
+            parts.headers.remove(name);
+        }
+        parts.headers.insert(
+            "content-length",
+            HeaderValue::from_str(&replacement.len().to_string())
+                .expect("a byte length is a valid header value"),
+        );
+        parts.headers.insert(
+            "content-type",
+            content_type.unwrap_or_else(|| HeaderValue::from_static("text/plain; charset=utf-8")),
+        );
+        if !upstream_http2 {
+            parts
+                .headers
+                .insert("connection", HeaderValue::from_static("close"));
+        }
+        exchange.update(|capture| {
+            capture.status = Some(parts.status.as_u16());
+            capture.response_headers = safe_headers(&parts.headers);
+            capture.response_bytes = replacement.len() as u64;
+        });
+        let (bodies, enabled, budget) = {
+            let state = exchange.shared.lock().unwrap();
+            (
+                state.response_bodies.clone(),
+                state.capture_bodies,
+                state.body_budget,
+            )
+        };
+        if enabled {
+            if let Err(error) = bodies
+                .store_complete(exchange.id, replacement.to_vec(), budget)
+                .await
+            {
+                exchange.update(|capture| {
+                    capture.response_body_error = Some(error);
+                });
+            }
+        }
+        exchange.finish(None);
+        return Ok(Response::from_parts(
+            parts,
+            Full::new(replacement)
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        ));
     }
     exchange.update(|capture| {
         capture.status = Some(parts.status.as_u16());

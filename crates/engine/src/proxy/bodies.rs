@@ -209,6 +209,51 @@ impl BodyStore {
         }
         Ok(())
     }
+    pub async fn store_complete(&self, id: u64, bytes: Vec<u8>, limit: u64) -> Result<(), String> {
+        let used = self.used.clone();
+        let (file, length) = tokio::task::spawn_blocking(move || {
+            let length = bytes.len() as u64;
+            used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(length).filter(|next| *next <= limit)
+            })
+            .map_err(|_| {
+                "Session disk budget reached; replacement body was not recorded.".to_string()
+            })?;
+            let result: Result<(tempfile::NamedTempFile, u64), String> = (|| {
+                let mut file = tempfile::Builder::new()
+                    .prefix("sippin-body-")
+                    .tempfile()
+                    .map_err(|_| "Cannot create replacement body storage.".to_string())?;
+                file.write_all(&bytes)
+                    .map_err(|_| "Cannot write replacement body storage.".to_string())?;
+                file.flush()
+                    .map_err(|_| "Cannot flush replacement body storage.".to_string())?;
+                Ok((file, length))
+            })();
+            if result.is_err() {
+                used.fetch_sub(length, Ordering::Relaxed);
+            }
+            result
+        })
+        .await
+        .map_err(|_| "Replacement body storage worker failed.".to_string())??;
+        let entry = Arc::new(Entry {
+            json: Mutex::new(inspect::JsonView::default()),
+            limit,
+            file: Mutex::new(Some(file)),
+            worker: Mutex::new(None),
+            budget: self.used.clone(),
+            reserved: AtomicU64::new(length),
+            total: AtomicU64::new(length),
+            cancelled: AtomicBool::new(false),
+            result: Mutex::new(("complete".into(), None)),
+            encoding: "identity".into(),
+        });
+        if let Some(previous) = self.entries.lock().unwrap().insert(id, entry) {
+            previous.cancel();
+        }
+        Ok(())
+    }
     pub fn remove(&self, id: u64) {
         if let Some(entry) = self.entries.lock().unwrap().remove(&id) {
             entry.cancel();

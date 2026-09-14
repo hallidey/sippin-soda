@@ -98,8 +98,10 @@ fn resolve_response_breakpoint(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
     id: u64,
     status: Option<u16>,
+    body: Option<String>,
+    content_type: Option<String>,
 ) -> Result<Snapshot, String> {
-    engine.resolve_response_breakpoint(id, status)
+    engine.resolve_response_breakpoint(id, status, body, content_type)
 }
 
 #[tauri::command]
