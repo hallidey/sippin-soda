@@ -127,6 +127,7 @@ function App() {
   const running = status?.phase === "running";
   const [port, setPort] = useState("8080");
   const [captureBodies, setCaptureBodies] = useState(false);
+  const [breakOnResponses, setBreakOnResponses] = useState(false);
   const [diskBudget, setDiskBudget] = useState("10");
   const [redactionPaths, setRedactionPaths] = useState("");
   const [developmentHosts, setDevelopmentHosts] = useState("");
@@ -240,6 +241,7 @@ function App() {
         clientProfileId: credential?.profileId ?? null,
         clientToken: credential?.token ?? null,
         enableHttpsInspection,
+        breakOnResponses,
       },
     });
     setProxyCredential(started ? credential : null);
@@ -520,6 +522,17 @@ function App() {
               <label>
                 <input
                   type="checkbox"
+                  checked={breakOnResponses}
+                  disabled={running || busy || !desktop}
+                  onChange={(event) =>
+                    setBreakOnResponses(event.target.checked)
+                  }
+                />{" "}
+                Pause Development responses for 15 seconds
+              </label>
+              <label>
+                <input
+                  type="checkbox"
                   checked={requireClientAuth}
                   disabled={running || busy || !desktop}
                   onChange={(event) =>
@@ -698,6 +711,9 @@ function App() {
               busy={busy}
               proxyCredential={proxyCredential}
               clear={() => void command("clear_traffic")}
+              resolveBreakpoint={(id, status) =>
+                void command("resolve_response_breakpoint", { id, status })
+              }
             />
           </>
         ) : section === "Settings" ? (

@@ -23,12 +23,14 @@ export function Traffic({
   busy,
   proxyCredential,
   clear,
+  resolveBreakpoint,
 }: {
   snapshot: Snapshot | null;
   desktop: boolean;
   busy: boolean;
   proxyCredential: { profileId: string; token: string } | null;
   clear: () => void;
+  resolveBreakpoint: (id: number, status: number | null) => void;
 }) {
   const [query, setQuery] = useState("");
   const [selectedId, select] = useState<number | null>(null);
@@ -225,6 +227,33 @@ export function Traffic({
                 {selected.error}
               </p>
             )}
+            {selected.breakpointState === "waiting" && (
+              <div className="capture-notice" role="status">
+                <p>
+                  Development response paused with status{" "}
+                  {selected.originalStatus}. It continues unchanged
+                  automatically after 15 seconds.
+                </p>
+                <button
+                  onClick={() => resolveBreakpoint(selected.id, null)}
+                  disabled={busy}
+                >
+                  Continue unchanged
+                </button>{" "}
+                <button
+                  onClick={() => resolveBreakpoint(selected.id, 500)}
+                  disabled={busy}
+                >
+                  Return 500
+                </button>{" "}
+                <button
+                  onClick={() => resolveBreakpoint(selected.id, 503)}
+                  disabled={busy}
+                >
+                  Return 503
+                </button>
+              </div>
+            )}
             {tab === "Request" ? (
               <>
                 <p>
@@ -262,6 +291,9 @@ export function Traffic({
                   {selected.status ?? "Waiting"} ·{" "}
                   {selected.responseBytes.toLocaleString()} bytes received
                 </p>
+                {selected.breakpointState === "modified" && (
+                  <p>Original upstream status: {selected.originalStatus}.</p>
+                )}
                 {selected.kind === "tunnel" || selected.kind === "tls" ? (
                   <p>Inner response headers are not available.</p>
                 ) : (

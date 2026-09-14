@@ -62,6 +62,10 @@ Identity, gzip (including multiple members), zlib-wrapped deflate and Brotli are
 
 Response body contents are **not redacted or encrypted at rest**. JSON request inspection files contain the built-in and custom-path redacted representation, but are also unencrypted. Recording is off by default and is never enabled by merely launching the app. Clear, retention eviction and normal exit remove temporary files; a crash may leave files behind, and deletion is not secure erasure. This is temporary inspection storage, not session persistence or portable export. HTTPS remains inaccessible inside opaque CONNECT tunnels; an explicitly inspected Development tunnel uses the same request-redaction and response-storage rules as plain HTTP.
 
+## Development response breakpoints
+
+Enable **Pause Development responses for 15 seconds** before starting the proxy. When an HTTP or inspected HTTPS response arrives for a Development destination, Traffic marks it as waiting. The inspector can continue the original response or replace only its final status with 500 or 503; headers and body are forwarded unchanged. If no decision arrives within 15 seconds, the original response continues automatically. Production and Unknown destinations never pause, and stale decisions are rejected.
+
 ## Validation
 
 Run `cargo test -p sippin-soda-engine` for real local TCP/HTTP/TLS fixtures. They cover forwarding, header rewriting/redaction, unsupported targets, loops, upstream errors, timeouts, stopping, port reuse, retention and large responses. CONNECT tests additionally verify early bytes, half-close, live counts, tracked concurrency, bounded lifetime and HTTPS with trusted/untrusted test certificates. Test certificates are ephemeral and trusted only by the test client; they never enter the OS trust store. See ADR 0001 for the remaining TLS interception and performance decision gates.

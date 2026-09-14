@@ -29,6 +29,7 @@ struct StartProxyOptions {
     client_profile_id: Option<String>,
     client_token: Option<String>,
     enable_https_inspection: bool,
+    break_on_responses: bool,
 }
 
 #[tauri::command]
@@ -86,9 +87,19 @@ async fn start_proxy(
             production_hosts: options.production_hosts,
             client_auth,
             tls_interception,
+            break_on_responses: options.break_on_responses,
             ..Default::default()
         })
         .await
+}
+
+#[tauri::command]
+fn resolve_response_breakpoint(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    status: Option<u16>,
+) -> Result<Snapshot, String> {
+    engine.resolve_response_breakpoint(id, status)
 }
 
 #[tauri::command]
@@ -382,7 +393,8 @@ fn main() {
             response_body_page,
             search_response_body,
             response_json_view,
-            response_json_page
+            response_json_page,
+            resolve_response_breakpoint
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Sippin Soda desktop")

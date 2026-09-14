@@ -1,6 +1,6 @@
 use crate::{
-    establish_verified_tls_with_config, platform_tls_client_config, CaManager, DestinationClass,
-    EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInterceptError,
+    authorize, establish_verified_tls_with_config, platform_tls_client_config, Action, CaManager,
+    DestinationClass, EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInterceptError,
     TlsTrustCheckManager, HTTP2_ALPN, INSPECTION_ALPN,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -22,7 +22,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     fmt,
     net::{Ipv4Addr, SocketAddr},
@@ -79,6 +79,7 @@ pub struct ProxyConfig {
     pub production_hosts: Vec<String>,
     pub client_auth: Option<ProxyClientAuth>,
     pub tls_interception: Option<ProxyTlsInterception>,
+    pub break_on_responses: bool,
 }
 
 type LeafIssuer =
@@ -236,6 +237,7 @@ impl Default for ProxyConfig {
             production_hosts: vec![],
             client_auth: None,
             tls_interception: None,
+            break_on_responses: false,
         }
     }
 }
@@ -261,6 +263,8 @@ pub struct Capture {
     pub request_body_state: String,
     pub request_body_error: Option<String>,
     pub response_body_error: Option<String>,
+    pub breakpoint_state: String,
+    pub original_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -429,6 +433,8 @@ struct State {
     body_budget: u64,
     request_redaction_paths: Vec<Vec<String>>,
     destination_classifier: DestinationClassifier,
+    break_on_responses: bool,
+    breakpoints: HashMap<u64, oneshot::Sender<Option<StatusCode>>>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -461,6 +467,8 @@ impl Default for ProxyEngine {
                 body_budget: 0,
                 request_redaction_paths: vec![],
                 destination_classifier: DestinationClassifier::default(),
+                break_on_responses: false,
+                breakpoints: HashMap::new(),
             })),
             running: tokio::sync::Mutex::new(None),
         }
@@ -468,6 +476,36 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub fn resolve_response_breakpoint(
+        &self,
+        id: u64,
+        status: Option<u16>,
+    ) -> Result<Snapshot, String> {
+        let status = status
+            .map(|value| {
+                StatusCode::from_u16(value)
+                    .ok()
+                    .filter(|status| {
+                        status.is_success()
+                            || status.is_redirection()
+                            || status.is_client_error()
+                            || status.is_server_error()
+                    })
+                    .ok_or("Replacement status must be between 200 and 599.")
+            })
+            .transpose()?;
+        let sender = self
+            .shared
+            .lock()
+            .unwrap()
+            .breakpoints
+            .remove(&id)
+            .ok_or("Response breakpoint is no longer waiting.")?;
+        sender
+            .send(status)
+            .map_err(|_| "Response breakpoint closed.".to_string())?;
+        Ok(self.snapshot())
+    }
     pub fn body_export_preview(
         &self,
         id: u64,
@@ -687,8 +725,10 @@ impl ProxyEngine {
             state.body_budget = config.body_disk_budget;
             state.request_redaction_paths = request_redaction_paths;
             state.destination_classifier = destination_classifier;
+            state.break_on_responses = config.break_on_responses;
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
+                    state.breakpoints.remove(&capture.id);
                     state.request_bodies.remove(capture.id);
                     state.response_bodies.remove(capture.id);
                 }
@@ -767,6 +807,7 @@ impl ProxyEngine {
 
     pub fn clear(&self) -> Snapshot {
         let mut state = self.shared.lock().unwrap();
+        state.breakpoints.clear();
         state.traffic.clear();
         state.request_bodies.clear();
         state.response_bodies.clear();
@@ -1136,6 +1177,7 @@ fn begin_exchange(
     state.next_id += 1;
     if state.traffic.len() == state.limit {
         if let Some(capture) = state.traffic.pop_front() {
+            state.breakpoints.remove(&capture.id);
             state.request_bodies.remove(capture.id);
             state.response_bodies.remove(capture.id);
         }
@@ -1168,6 +1210,8 @@ fn begin_exchange(
         request_body_state: "disabled".into(),
         request_body_error: None,
         response_body_error: None,
+        breakpoint_state: "none".into(),
+        original_status: None,
     });
     state.status.captures = state.traffic.len();
     state.revision += 1;
@@ -1321,6 +1365,53 @@ async fn forward_with_sender(
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP request failed."))?;
     let (mut parts, body) = upstream.into_parts();
+    let breakpoint = {
+        let mut state = exchange.shared.lock().unwrap();
+        let enabled = state.break_on_responses
+            && state
+                .traffic
+                .iter()
+                .find(|capture| capture.id == exchange.id)
+                .is_some_and(|capture| {
+                    authorize(capture.destination_class, Action::Modify).is_ok()
+                });
+        if enabled {
+            let (sender, receiver) = oneshot::channel();
+            state.breakpoints.insert(exchange.id, sender);
+            if let Some(capture) = state
+                .traffic
+                .iter_mut()
+                .find(|capture| capture.id == exchange.id)
+            {
+                capture.breakpoint_state = "waiting".into();
+                capture.original_status = Some(parts.status.as_u16());
+            }
+            state.revision += 1;
+            Some(receiver)
+        } else {
+            None
+        }
+    };
+    if let Some(receiver) = breakpoint {
+        let decision = timeout(Duration::from_secs(15), receiver).await;
+        exchange
+            .shared
+            .lock()
+            .unwrap()
+            .breakpoints
+            .remove(&exchange.id);
+        match decision {
+            Ok(Ok(Some(status))) => {
+                parts.status = status;
+                exchange.update(|capture| capture.breakpoint_state = "modified".into());
+            }
+            Ok(Ok(None)) => {
+                exchange.update(|capture| capture.breakpoint_state = "continued".into())
+            }
+            _ => exchange.update(|capture| capture.breakpoint_state = "timed_out".into()),
+        }
+        exchange.shared.lock().unwrap().revision += 1;
+    }
     exchange.update(|capture| {
         capture.status = Some(parts.status.as_u16());
         capture.response_headers = safe_headers(&parts.headers);

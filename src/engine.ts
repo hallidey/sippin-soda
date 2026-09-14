@@ -22,6 +22,8 @@ export type Capture = {
     "disabled" | "empty" | "recording" | "complete" | "unavailable";
   requestBodyError: string | null;
   responseBodyError: string | null;
+  breakpointState: "none" | "waiting" | "continued" | "modified" | "timed_out";
+  originalStatus: number | null;
 };
 
 export type Snapshot = {

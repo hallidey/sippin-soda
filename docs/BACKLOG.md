@@ -6,7 +6,7 @@ The authoritative product baseline is [MASTER_PROMPT.md](../MASTER_PROMPT.md). T
 | --- | --- | --- | --- |
 | Desktop foundation | v0.1 | Tauri/React scaffold, theme settings, honest empty states | UI build; CI native compilation |
 | F01 Observe | v0.1 | HTTP proxy, CONNECT, bounded metadata, disk-backed response inspection and redacted JSON request inspection for HTTP and persistent HTTP/1 HTTPS tunnels | Real HTTP/TCP/TLS fixtures plus request-redaction, 128 MiB response/tail and compressed body tests |
-| F02 Intercept/modify | v0.1 | Planned | Pause response, change 200 to 500, continue |
+| F02 Intercept/modify | v0.1 | Explicit Development-only response breakpoint with 15-second fail-safe and controlled final-status replacement; header/body editing pending | Pause response, change 200 to 500, continue |
 | F03 Replay | v0.1 / v0.3 sessions | Planned | Replay targets local fixture; cancellation and ordering |
 | F04 Rules | v0.1 / v0.3 advanced | Planned | Delay/status rule survives restart |
 | F05 Chaos | v0.3 | Planned | Seeded faults and bounded scope |
