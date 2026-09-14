@@ -90,7 +90,7 @@ impl TlsInspectionGate {
         client: C,
         leaf: IssuedLeaf,
         handshake_timeout: Duration,
-    ) -> Result<(), TlsTrustError>
+    ) -> Result<tokio_rustls::server::TlsStream<C>, TlsTrustError>
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
@@ -98,8 +98,9 @@ impl TlsInspectionGate {
             return Err(TlsTrustError::InspectionDisabled);
         }
         self.trust_proof = None;
-        self.trust_proof = Some(client_trust_handshake(client, leaf, handshake_timeout).await?);
-        Ok(())
+        let (proof, stream) = client_trust_handshake(client, leaf, handshake_timeout).await?;
+        self.trust_proof = Some(proof);
+        Ok(stream)
     }
 
     pub fn readiness(&self, ca: &CaStatus) -> TlsInspectionReadiness {
@@ -163,7 +164,7 @@ async fn client_trust_handshake<C>(
     client: C,
     leaf: IssuedLeaf,
     handshake_timeout: Duration,
-) -> Result<TlsClientTrustProof, TlsTrustError>
+) -> Result<(TlsClientTrustProof, tokio_rustls::server::TlsStream<C>), TlsTrustError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
@@ -179,14 +180,14 @@ where
             PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
         )
         .map_err(|_| TlsTrustError::InvalidLeafMaterial)?;
-    tokio::time::timeout(
+    let stream = tokio::time::timeout(
         handshake_timeout,
         TlsAcceptor::from(Arc::new(server)).accept(client),
     )
     .await
     .map_err(|_| TlsTrustError::HandshakeTimeout)?
     .map_err(|_| TlsTrustError::ClientRejectedCertificate)?;
-    Ok(proof)
+    Ok((proof, stream))
 }
 
 /// Terminates a client TLS stream and establishes a separately verified TLS
@@ -329,7 +330,7 @@ mod tests {
         let verification = gate.verify_client_trust(server_side, leaf, Duration::from_secs(2));
         let client_connection = downstream_client(client_side, ca_pem.as_bytes());
         let (verification, client) = tokio::join!(verification, client_connection);
-        verification.unwrap();
+        drop(verification.unwrap());
         drop(client.unwrap());
         let readiness = gate.readiness(&status);
         assert_eq!(readiness.state, TlsReadinessState::Ready);
@@ -407,12 +408,12 @@ mod tests {
         let (_, leaf, _) = CaManager::ephemeral_leaf_for_test("client.dev.test");
         let (server_side, _client_side) = tokio::io::duplex(1024);
         let mut disabled = TlsInspectionGate::default();
-        assert_eq!(
+        assert!(matches!(
             disabled
                 .verify_client_trust(server_side, leaf, Duration::from_secs(2))
                 .await,
             Err(TlsTrustError::InspectionDisabled)
-        );
+        ));
     }
 
     #[tokio::test]
