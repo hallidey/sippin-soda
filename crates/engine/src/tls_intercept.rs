@@ -50,8 +50,19 @@ pub struct TlsClientIdentity {
 
 impl TlsClientIdentity {
     pub fn new(id: &str, name: &str) -> Result<Self, String> {
-        let id = id.trim();
+        let id = Self::validate_id(id)?;
         let name = name.trim();
+        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            return Err("Client profile names must contain 1-80 visible characters.".into());
+        }
+        Ok(Self {
+            id,
+            name: name.into(),
+        })
+    }
+
+    pub fn validate_id(id: &str) -> Result<String, String> {
+        let id = id.trim();
         if id.is_empty()
             || id.len() > 64
             || !id
@@ -60,13 +71,7 @@ impl TlsClientIdentity {
         {
             return Err("Client profile IDs must use 1-64 letters, numbers, '-' or '_'.".into());
         }
-        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
-            return Err("Client profile names must contain 1-80 visible characters.".into());
-        }
-        Ok(Self {
-            id: id.into(),
-            name: name.into(),
-        })
+        Ok(id.into())
     }
 
     pub fn id(&self) -> &str {

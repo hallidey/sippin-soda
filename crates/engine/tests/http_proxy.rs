@@ -1,4 +1,5 @@
-use sippin_soda_engine::{EnginePhase, ProxyConfig, ProxyEngine};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use sippin_soda_engine::{EnginePhase, ProxyClientAuth, ProxyConfig, ProxyEngine};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -89,6 +90,66 @@ async fn forwards_to_real_upstream_and_captures_only_filtered_metadata() {
         .response_headers
         .iter()
         .any(|(name, value)| name == "set-cookie" && value == "[REDACTED]"));
+}
+
+#[tokio::test]
+async fn optional_proxy_authentication_binds_accepted_requests_to_one_profile() {
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    let (upstream, received) =
+        fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let port = snapshot.status.listen_address.port();
+    assert_eq!(
+        snapshot.status.client_profile_id.as_deref(),
+        Some("browser-1")
+    );
+
+    let missing = send(
+        port,
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(missing.starts_with("HTTP/1.1 407"));
+    assert!(missing.to_ascii_lowercase().contains("proxy-authenticate"));
+    let wrong = BASE64.encode(format!("browser-1:{TOKEN}x"));
+    assert!(
+        send(
+            port,
+            format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic {wrong}\r\n\r\n"),
+        )
+        .await
+        .starts_with("HTTP/1.1 407")
+    );
+    assert!(engine.snapshot().traffic.is_empty());
+
+    let valid = BASE64.encode(format!("browser-1:{TOKEN}"));
+    assert!(
+        send(
+            port,
+            format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic {valid}\r\n\r\n"),
+        )
+        .await
+        .starts_with("HTTP/1.1 204")
+    );
+    let forwarded = received.await.unwrap();
+    assert!(!forwarded
+        .to_ascii_lowercase()
+        .contains("proxy-authorization"));
+    let snapshot = engine.stop().await;
+    assert!(snapshot.status.client_profile_id.is_none());
+    assert_eq!(snapshot.traffic.len(), 1);
+    assert_eq!(
+        snapshot.traffic[0].client_profile_id.as_deref(),
+        Some("browser-1")
+    );
 }
 
 #[tokio::test]

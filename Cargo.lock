@@ -3704,6 +3704,7 @@ name = "sippin-soda-engine"
 version = "0.1.0"
 dependencies = [
  "async-compression",
+ "base64 0.22.1",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3713,6 +3714,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "sysinfo",
  "tempfile",
  "time",

@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sippin_soda_engine::{
-    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus, ProxyConfig,
-    ProxyEngine, SearchStep, Snapshot, TlsClientIdentity, TlsTrustCheckManager,
-    TlsTrustCheckStatus,
+    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus,
+    ProxyClientAuth, ProxyConfig, ProxyEngine, SearchStep, Snapshot, TlsClientIdentity,
+    TlsTrustCheckManager, TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -17,6 +17,19 @@ struct BodyExportResult {
     bytes: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartProxyOptions {
+    port: u16,
+    capture_bodies: bool,
+    disk_budget_gib: u32,
+    request_redaction_paths: Vec<String>,
+    development_hosts: Vec<String>,
+    production_hosts: Vec<String>,
+    client_profile_id: Option<String>,
+    client_token: Option<String>,
+}
+
 #[tauri::command]
 fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
     engine.snapshot()
@@ -25,24 +38,25 @@ fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
 #[tauri::command]
 async fn start_proxy(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
-    port: u16,
-    capture_bodies: bool,
-    disk_budget_gib: u32,
-    request_redaction_paths: Vec<String>,
-    development_hosts: Vec<String>,
-    production_hosts: Vec<String>,
+    options: StartProxyOptions,
 ) -> Result<Snapshot, String> {
-    if !(1..=1024).contains(&disk_budget_gib) {
+    if !(1..=1024).contains(&options.disk_budget_gib) {
         return Err("Disk budget must be between 1 and 1024 GiB.".into());
     }
+    let client_auth = match (options.client_profile_id, options.client_token) {
+        (None, None) => None,
+        (Some(profile_id), Some(token)) => Some(ProxyClientAuth::new(&profile_id, &token)?),
+        _ => return Err("Proxy client profile and token must be configured together.".into()),
+    };
     engine
         .start(ProxyConfig {
-            port,
-            capture_bodies,
-            body_disk_budget: u64::from(disk_budget_gib) * 1024 * 1024 * 1024,
-            request_redaction_paths,
-            development_hosts,
-            production_hosts,
+            port: options.port,
+            capture_bodies: options.capture_bodies,
+            body_disk_budget: u64::from(options.disk_budget_gib) * 1024 * 1024 * 1024,
+            request_redaction_paths: options.request_redaction_paths,
+            development_hosts: options.development_hosts,
+            production_hosts: options.production_hosts,
+            client_auth,
             ..Default::default()
         })
         .await

@@ -1,4 +1,5 @@
-use crate::{DestinationClass, EnginePhase, EngineStatus};
+use crate::{DestinationClass, EnginePhase, EngineStatus, TlsClientIdentity};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 mod bodies;
 mod tunnel;
 pub use bodies::{BodyPage, JsonStatus, SearchStep};
@@ -13,6 +14,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -22,6 +24,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
@@ -44,6 +47,61 @@ pub struct ProxyConfig {
     pub request_redaction_paths: Vec<String>,
     pub development_hosts: Vec<String>,
     pub production_hosts: Vec<String>,
+    pub client_auth: Option<ProxyClientAuth>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyClientAuth {
+    profile_id: String,
+    token_sha256: [u8; 32],
+}
+
+impl ProxyClientAuth {
+    pub fn new(profile_id: &str, token: &str) -> Result<Self, String> {
+        let profile_id = TlsClientIdentity::validate_id(profile_id)?;
+        if !(32..=128).contains(&token.len())
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("Proxy client tokens must use 32-128 letters, numbers, '-' or '_'.".into());
+        }
+        Ok(Self {
+            profile_id,
+            token_sha256: Sha256::digest(token.as_bytes()).into(),
+        })
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    fn accepts(&self, headers: &HeaderMap) -> bool {
+        let Some(value) = headers
+            .get("proxy-authorization")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        let Some(encoded) = value
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+            .map(|(_, encoded)| encoded.trim())
+        else {
+            return false;
+        };
+        let Ok(decoded) = BASE64.decode(encoded) else {
+            return false;
+        };
+        let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let (profile_id, token) = decoded.split_at(separator);
+        let token = &token[1..];
+        let presented_token_sha256: [u8; 32] = Sha256::digest(token).into();
+        profile_id == self.profile_id.as_bytes()
+            && bool::from(presented_token_sha256.ct_eq(&self.token_sha256))
+    }
 }
 
 impl Default for ProxyConfig {
@@ -59,6 +117,7 @@ impl Default for ProxyConfig {
             request_redaction_paths: vec![],
             development_hosts: vec![],
             production_hosts: vec![],
+            client_auth: None,
         }
     }
 }
@@ -71,6 +130,7 @@ pub struct Capture {
     pub method: String,
     pub target: String,
     pub destination_class: DestinationClass,
+    pub client_profile_id: Option<String>,
     pub started_at: u64,
     pub status: Option<u16>,
     pub phase: String,
@@ -510,6 +570,10 @@ impl ProxyEngine {
             state.status.captures = state.traffic.len();
             state.status.phase = EnginePhase::Running;
             state.status.listen_address = address;
+            state.status.client_profile_id = config
+                .client_auth
+                .as_ref()
+                .map(|auth| auth.profile_id().to_owned());
             state.revision += 1;
         }
         let (shutdown, mut stop) = oneshot::channel();
@@ -531,12 +595,13 @@ impl ProxyEngine {
                             continue;
                         }
                         let shared = shared.clone();
+                        let client_auth = config.client_auth.clone();
                         let deadline = config.request_timeout;
                         let tunnel_deadline = config.tunnel_timeout;
                         connections.spawn(async move {
                             let (tunnel_tx, mut tunnel_rx) = oneshot::channel::<Tunnel>();
                             let tunnel_slot = Arc::new(Mutex::new(Some(tunnel_tx)));
-                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone()));
+                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone(), client_auth.clone()));
                             // The same tracked task owns HTTP negotiation AND the tunnel,
                             // so upgrades cannot escape the connection cap or Stop.
                             let mut builder = http1::Builder::new();
@@ -554,6 +619,7 @@ impl ProxyEngine {
             drop(listener);
             let mut state = shared.lock().unwrap();
             state.status.phase = EnginePhase::Stopped;
+            state.status.client_profile_id = None;
             state.revision += 1;
         });
         *running = Some(Running { shutdown, task });
@@ -858,13 +924,31 @@ fn response(status: StatusCode, message: &'static str) -> Response<WireBody> {
     response
 }
 
+fn proxy_authentication_required() -> Response<WireBody> {
+    let mut result = response(
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        "Valid proxy client credentials are required.",
+    );
+    result.headers_mut().insert(
+        "proxy-authenticate",
+        HeaderValue::from_static("Basic realm=\"Sippin Soda\", charset=\"UTF-8\""),
+    );
+    result
+}
+
 async fn handle(
     request: Request<Incoming>,
     shared: Shared,
     proxy: SocketAddr,
     deadline: Duration,
     tunnel_slot: Arc<Mutex<Option<oneshot::Sender<Tunnel>>>>,
+    client_auth: Option<ProxyClientAuth>,
 ) -> Result<Response<WireBody>, Infallible> {
+    let client_profile_id = match client_auth {
+        Some(auth) if auth.accepts(request.headers()) => Some(auth.profile_id().to_owned()),
+        Some(_) => return Ok(proxy_authentication_required()),
+        None => None,
+    };
     let destination_class = {
         let state = shared.lock().unwrap();
         state
@@ -893,6 +977,7 @@ async fn handle(
             method: request.method().to_string(),
             target: safe_target(&request),
             destination_class,
+            client_profile_id,
             started_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

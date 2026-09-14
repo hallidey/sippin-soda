@@ -21,11 +21,13 @@ export function Traffic({
   snapshot,
   desktop,
   busy,
+  proxyCredential,
   clear,
 }: {
   snapshot: Snapshot | null;
   desktop: boolean;
   busy: boolean;
+  proxyCredential: { profileId: string; token: string } | null;
   clear: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -39,6 +41,9 @@ export function Traffic({
       .includes(query.toLowerCase()),
   );
   const running = snapshot?.status.phase === "running";
+  const proxyAuth = proxyCredential
+    ? ` --proxy-user "${proxyCredential.profileId}:${proxyCredential.token}"`
+    : "";
 
   return (
     <>
@@ -154,7 +159,7 @@ export function Traffic({
                   : "Start the proxy in the desktop app, then configure your HTTP client."}
             </p>
             {!query && (
-              <code className="setup-command">{`curl --noproxy "" --proxy http://${snapshot?.status.listenAddress ?? "127.0.0.1:8080"} http://127.0.0.1:9090/health`}</code>
+              <code className="setup-command">{`curl --noproxy ""${proxyAuth} --proxy http://${snapshot?.status.listenAddress ?? "127.0.0.1:8080"} http://127.0.0.1:9090/health`}</code>
             )}
             <p>Use the local fixture from the development guide.</p>
           </div>
@@ -172,8 +177,12 @@ export function Traffic({
             </h2>
             <p className={`destination-class ${selected.destinationClass}`}>
               Effective destination: {selected.destinationClass}. Production
-              Safety Mode applies to active operations using this classification.
+              Safety Mode applies to active operations using this
+              classification.
             </p>
+            {selected.clientProfileId && (
+              <p>Authenticated client profile: {selected.clientProfileId}</p>
+            )}
             {selected.kind === "tunnel" && (
               <p className="capture-notice">
                 Opaque CONNECT tunnel. Status 200 means the tunnel opened; the
@@ -209,7 +218,10 @@ export function Traffic({
                 <Headers values={selected.requestHeaders} />
                 {selected.requestBodyState === "disabled" ? (
                   selected.requestBytes > 0 && (
-                    <p>Request body recording was disabled when the proxy started.</p>
+                    <p>
+                      Request body recording was disabled when the proxy
+                      started.
+                    </p>
                   )
                 ) : selected.requestBodyState === "empty" ? (
                   <p>No request body.</p>
@@ -262,8 +274,8 @@ export function Traffic({
             )}
             <p>
               Encrypted tunnel contents are not recorded. HTTP body recording
-              must be enabled before Start; request inspection currently
-              accepts JSON up to 1 MiB and stores only its redacted copy.
+              must be enabled before Start; request inspection currently accepts
+              JSON up to 1 MiB and stores only its redacted copy.
             </p>
           </>
         ) : (

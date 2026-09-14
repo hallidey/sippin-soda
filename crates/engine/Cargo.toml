@@ -11,6 +11,8 @@ serde_json = "1"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 keyring = "4"
 sha2 = "0.10"
+base64 = "0.22"
+subtle = "2.6"
 time = "0.3"
 zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "fs"] }

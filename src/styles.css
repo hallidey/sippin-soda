@@ -729,6 +729,15 @@ input:focus-visible {
   resize: vertical;
   font-family: Consolas, monospace;
 }
+.proxy-credential {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+}
+.proxy-credential p {
+  margin: 6px 0;
+}
 .destination-rules {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

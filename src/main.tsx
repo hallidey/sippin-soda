@@ -36,6 +36,10 @@ type TlsClientProfile = {
   id: string;
   name: string;
 };
+type ProxyCredential = {
+  profileId: string;
+  token: string;
+};
 
 const clientProfilesKey = "sippin-tls-client-profiles";
 
@@ -126,8 +130,14 @@ function App() {
     () => loadClientProfiles()[0]?.id ?? "",
   );
   const [newClientName, setNewClientName] = useState("");
+  const [requireClientAuth, setRequireClientAuth] = useState(false);
+  const [proxyCredential, setProxyCredential] =
+    useState<ProxyCredential | null>(null);
   const selectedClient =
     clientProfiles.find((profile) => profile.id === selectedClientId) ?? null;
+  const activeProxyClient =
+    clientProfiles.find((profile) => profile.id === status?.clientProfileId) ??
+    null;
   const parseHostRules = (value: string) =>
     value
       .split(/[\n,]/)
@@ -161,6 +171,37 @@ function App() {
     Number(diskBudget) <= 1024;
   const validPort =
     /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+
+  const createClientToken = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+  };
+
+  const proxyCommand = async () => {
+    if (running) {
+      if (await command("stop_proxy")) setProxyCredential(null);
+      return;
+    }
+    const credential =
+      requireClientAuth && selectedClient
+        ? { profileId: selectedClient.id, token: createClientToken() }
+        : null;
+    const started = await command("start_proxy", {
+      options: {
+        port: Number(port),
+        captureBodies,
+        diskBudgetGib: Number(diskBudget),
+        requestRedactionPaths: parsedRedactionPaths,
+        developmentHosts: parsedDevelopmentHosts,
+        productionHosts: parsedProductionHosts,
+        clientProfileId: credential?.profileId ?? null,
+        clientToken: credential?.token ?? null,
+      },
+    });
+    setProxyCredential(started ? credential : null);
+  };
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -263,7 +304,7 @@ function App() {
     setNewClientName("");
   };
   const removeSelectedClient = () => {
-    if (!selectedClient) return;
+    if (!selectedClient || running) return;
     if (trustCheck?.client?.id === selectedClient.id) {
       void trustCheckCommand("cancel_tls_trust_check");
     }
@@ -386,23 +427,10 @@ function App() {
                     (!validPort ||
                       !validBudget ||
                       !validRedactionPaths ||
-                      !validHostRules))
+                      !validHostRules ||
+                      (requireClientAuth && !selectedClient)))
                 }
-                onClick={() =>
-                  void command(
-                    running ? "stop_proxy" : "start_proxy",
-                    running
-                      ? undefined
-                      : {
-                          port: Number(port),
-                          captureBodies,
-                          diskBudgetGib: Number(diskBudget),
-                          requestRedactionPaths: parsedRedactionPaths,
-                          developmentHosts: parsedDevelopmentHosts,
-                          productionHosts: parsedProductionHosts,
-                        },
-                  )
-                }
+                onClick={() => void proxyCommand()}
               >
                 {busy ? "Please wait…" : running ? "Stop proxy" : "Start proxy"}
               </button>
@@ -426,6 +454,63 @@ function App() {
                 />{" "}
                 Record HTTP bodies
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={requireClientAuth}
+                  disabled={running || busy || !desktop}
+                  onChange={(event) =>
+                    setRequireClientAuth(event.target.checked)
+                  }
+                />{" "}
+                Require client profile authentication
+              </label>
+              {requireClientAuth && (
+                <label>
+                  Authenticated client profile{" "}
+                  <select
+                    value={selectedClientId}
+                    disabled={running || busy || !desktop}
+                    onChange={(event) =>
+                      setSelectedClientId(event.target.value)
+                    }
+                  >
+                    <option value="">Choose a configured client</option>
+                    {clientProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {running && proxyCredential && (
+                <div className="proxy-credential" role="status">
+                  <strong>
+                    Authentication required for{" "}
+                    {activeProxyClient?.name ?? "client"}
+                  </strong>
+                  <p>
+                    Configure HTTP Basic proxy credentials with username{" "}
+                    <code>{proxyCredential.profileId}</code> and this ephemeral
+                    password:
+                  </p>
+                  <code className="trust-check-url">
+                    {proxyCredential.token}
+                  </code>
+                  <p>
+                    The password exists only for this proxy run and is not
+                    included in captures.
+                  </p>
+                </div>
+              )}
+              {running && status?.clientProfileId && !proxyCredential && (
+                <p className="error" role="alert">
+                  This proxy run requires client authentication, but its
+                  ephemeral password is no longer available in the UI. Stop and
+                  restart the proxy to generate a new credential.
+                </p>
+              )}
               <label>
                 Session disk budget (GiB){" "}
                 <input
@@ -506,6 +591,7 @@ function App() {
               snapshot={snapshot}
               desktop={desktop}
               busy={busy}
+              proxyCredential={proxyCredential}
               clear={() => void command("clear_traffic")}
             />
           </>
@@ -543,6 +629,12 @@ function App() {
               </dd>
               <dt>HTTPS pass-through</dt>
               <dd>CONNECT supported · 5 minute tunnel limit</dd>
+              <dt>Client authentication</dt>
+              <dd>
+                {status?.clientProfileId
+                  ? `Required · ${status.clientProfileId}`
+                  : "Optional · disabled for this proxy run"}
+              </dd>
               <dt>Production policy</dt>
               <dd>
                 {status?.productionProtection
@@ -595,7 +687,9 @@ function App() {
                         id="tls-client-profile"
                         value={selectedClientId}
                         disabled={
-                          trustCheck?.state === "waiting" || trustCheckBusy
+                          running ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
                         }
                         onChange={(event) =>
                           setSelectedClientId(event.target.value)
@@ -611,6 +705,7 @@ function App() {
                       <button
                         disabled={
                           !selectedClient ||
+                          running ||
                           trustCheck?.state === "waiting" ||
                           trustCheckBusy
                         }
@@ -624,7 +719,9 @@ function App() {
                         value={newClientName}
                         maxLength={80}
                         disabled={
-                          trustCheck?.state === "waiting" || trustCheckBusy
+                          running ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
                         }
                         aria-label="New client profile name"
                         placeholder="Chrome development profile"
@@ -635,6 +732,7 @@ function App() {
                       <button
                         disabled={
                           !newClientName.trim() ||
+                          running ||
                           trustCheck?.state === "waiting" ||
                           trustCheckBusy
                         }

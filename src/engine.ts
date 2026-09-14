@@ -8,6 +8,7 @@ export type Capture = {
   method: string;
   target: string;
   destinationClass: "development" | "production" | "unknown";
+  clientProfileId: string | null;
   startedAt: number;
   status: number | null;
   phase: "pending" | "complete" | "error";
@@ -17,7 +18,8 @@ export type Capture = {
   requestHeaders: [string, string][];
   responseHeaders: [string, string][];
   error: string | null;
-  requestBodyState: "disabled" | "empty" | "recording" | "complete" | "unavailable";
+  requestBodyState:
+    "disabled" | "empty" | "recording" | "complete" | "unavailable";
   requestBodyError: string | null;
   responseBodyError: string | null;
 };
@@ -32,6 +34,7 @@ export type Snapshot = {
     productionProtection: boolean;
     evictedCaptures: number;
     rejectedConnections: number;
+    clientProfileId: string | null;
   };
   traffic: Capture[];
 };
@@ -84,10 +87,12 @@ export function useEngine() {
     setError("");
     try {
       accept(await invoke<Snapshot>(name, args));
+      return true;
     } catch (cause) {
       setError(
         typeof cause === "string" ? cause : "The engine command failed.",
       );
+      return false;
     } finally {
       setBusy(false);
     }
