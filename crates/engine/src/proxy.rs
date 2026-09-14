@@ -1,7 +1,7 @@
 use crate::{
     establish_verified_tls_with_config, platform_tls_client_config, CaManager, DestinationClass,
     EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInterceptError,
-    TlsTrustCheckManager, HTTP1_ALPN,
+    TlsTrustCheckManager, HTTP2_ALPN, INSPECTION_ALPN,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 mod bodies;
@@ -17,6 +17,7 @@ use hyper::{
     service::service_fn,
     Method, Request, Response, StatusCode,
 };
+use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -42,6 +43,27 @@ use tokio_rustls::rustls::ClientConfig;
 use tunnel::Tunnel;
 
 type WireBody = BoxBody<Bytes, hyper::Error>;
+
+enum UpstreamSender {
+    Http1(hyper::client::conn::http1::SendRequest<RequestBody>),
+    Http2(hyper::client::conn::http2::SendRequest<RequestBody>),
+}
+
+impl UpstreamSender {
+    fn is_http2(&self) -> bool {
+        matches!(self, Self::Http2(_))
+    }
+
+    async fn send_request(
+        &mut self,
+        request: Request<RequestBody>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
+        match self {
+            Self::Http1(sender) => sender.send_request(request).await,
+            Self::Http2(sender) => sender.send_request(request).await,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -1204,12 +1226,13 @@ async fn forward_connected<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP handshake failed."))?;
     let connection = tokio::spawn(async move {
         let _ = connection.await;
     });
+    let mut sender = UpstreamSender::Http1(sender);
     forward_with_sender(
         request,
         exchange,
@@ -1223,18 +1246,27 @@ where
 async fn forward_with_sender(
     mut request: Request<Incoming>,
     exchange: Arc<Exchange>,
-    sender: &mut hyper::client::conn::http1::SendRequest<RequestBody>,
+    sender: &mut UpstreamSender,
     authority: Authority,
     connection: Option<ConnectionGuard>,
 ) -> Result<Response<WireBody>, ForwardError> {
-    let path = request
+    let path: hyper::http::uri::PathAndQuery = request
         .uri()
         .path_and_query()
         .map(|v| v.as_str())
         .unwrap_or("/")
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid request path."))?;
-    *request.uri_mut() = path;
+    *request.uri_mut() = if sender.is_http2() {
+        hyper::Uri::builder()
+            .scheme("https")
+            .authority(authority.clone())
+            .path_and_query(path)
+            .build()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid HTTPS request target."))?
+    } else {
+        path.into()
+    };
     strip_hop_headers(request.headers_mut());
     request.headers_mut().insert(
         HOST,
@@ -1480,6 +1512,7 @@ mod destination_tests {
 #[cfg(test)]
 mod tls_listener_tests {
     use super::*;
+    use crate::HTTP1_ALPN;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::{
@@ -1728,6 +1761,148 @@ mod tls_listener_tests {
             r#"{"sequence":2}"#
         );
         assert_eq!(second.phase, "complete");
+    }
+
+    #[tokio::test]
+    async fn authenticated_development_connect_captures_multiplexed_http2_streams() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let identity = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.cert.der().clone()).unwrap();
+        let mut upstream_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        upstream_config.alpn_protocols = vec![HTTP2_ALPN.to_vec(), HTTP1_ALPN.to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let tls = TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP2_ALPN));
+            let service = service_fn(|request: Request<Incoming>| async move {
+                let status = if request.uri().path() == "/one" {
+                    201
+                } else {
+                    202
+                };
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let mut response = Response::new(Full::new(body));
+                *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                Ok::<_, Infallible>(response)
+            });
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await
+        });
+
+        let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("127.0.0.1");
+        let engine = ProxyEngine::default();
+        let snapshot = engine
+            .start(ProxyConfig {
+                port: 0,
+                client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
+                tls_interception: Some(test_interception(leaf, Arc::new(upstream_config))),
+                capture_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(snapshot.status.listen_address)
+            .await
+            .unwrap();
+        let credentials = BASE64.encode(format!("browser-1:{TOKEN}"));
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(response_headers(&mut client)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let tls = TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP2_ALPN));
+        let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        let connection = tokio::spawn(connection);
+        let mut first_sender = sender.clone();
+        let mut second_sender = sender;
+        let first = Request::post(format!("https://127.0.0.1:{upstream_port}/one?token=a"))
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{\"password\":\"secret\"}")))
+            .unwrap();
+        let second = Request::get(format!("https://127.0.0.1:{upstream_port}/two?token=b"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (first, second) = tokio::join!(
+            first_sender.send_request(first),
+            second_sender.send_request(second)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.status(), 201);
+        assert_eq!(second.status(), 202);
+        first.into_body().collect().await.unwrap();
+        second.into_body().collect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while {
+                let snapshot = engine.snapshot();
+                snapshot.traffic.len() != 2
+                    || snapshot
+                        .traffic
+                        .iter()
+                        .any(|capture| capture.phase == "pending")
+            } {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = engine.stop().await;
+        assert_eq!(snapshot.traffic.len(), 2);
+        assert!(snapshot
+            .traffic
+            .iter()
+            .all(|capture| capture.kind == "https"));
+        assert!(snapshot
+            .traffic
+            .iter()
+            .any(|capture| capture.status == Some(201)));
+        assert!(snapshot
+            .traffic
+            .iter()
+            .any(|capture| capture.status == Some(202)));
+        connection.abort();
+        upstream.abort();
     }
 
     #[tokio::test]

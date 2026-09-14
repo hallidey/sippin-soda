@@ -27,6 +27,8 @@ pub enum TlsInterceptError {
 }
 
 pub(crate) const HTTP1_ALPN: &[u8] = b"http/1.1";
+pub(crate) const HTTP2_ALPN: &[u8] = b"h2";
+pub(crate) const INSPECTION_ALPN: [&[u8]; 2] = [HTTP2_ALPN, HTTP1_ALPN];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsBridgeResult {
@@ -290,7 +292,7 @@ pub(crate) fn platform_tls_client_config() -> Result<Arc<ClientConfig>, String> 
         .with_platform_verifier()
         .map(|builder| {
             let mut config = builder.with_no_client_auth();
-            config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+            config.alpn_protocols = INSPECTION_ALPN.iter().map(|value| value.to_vec()).collect();
             Arc::new(config)
         })
         .map_err(|_| "Cannot initialize platform TLS certificate verification.".into())
@@ -340,6 +342,7 @@ where
 pub(crate) struct VerifiedTls<C> {
     pub(crate) downstream: tokio_rustls::server::TlsStream<C>,
     pub(crate) upstream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    pub(crate) protocol: Option<Vec<u8>>,
 }
 
 pub(crate) async fn establish_verified_tls_with_config<C>(
@@ -349,7 +352,7 @@ pub(crate) async fn establish_verified_tls_with_config<C>(
     leaf: IssuedLeaf,
     client_config: Arc<ClientConfig>,
     handshake_timeout: Duration,
-    required_alpn: Option<&[u8]>,
+    allowed_alpn: Option<&[&[u8]]>,
 ) -> Result<VerifiedTls<C>, TlsInterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -363,29 +366,35 @@ where
             PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
         )
         .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
-    if let Some(protocol) = required_alpn {
-        server.alpn_protocols = vec![protocol.to_vec()];
-    }
-    let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
     let verified_upstream = TlsConnector::from(client_config).connect(upstream_name, upstream);
     let (downstream, upstream) = tokio::time::timeout(handshake_timeout, async {
         let upstream = verified_upstream
             .await
             .map_err(|_| TlsInterceptError::UpstreamVerification)?;
-        let downstream = downstream
+        let protocol = upstream.get_ref().1.alpn_protocol();
+        if allowed_alpn
+            .is_some_and(|allowed| !protocol.is_some_and(|protocol| allowed.contains(&protocol)))
+        {
+            return Err(TlsInterceptError::UnsupportedApplicationProtocol);
+        }
+        if let Some(protocol) = protocol {
+            server.alpn_protocols = vec![protocol.to_vec()];
+        }
+        let downstream = TlsAcceptor::from(Arc::new(server))
+            .accept(client)
             .await
             .map_err(|_| TlsInterceptError::DownstreamHandshake)?;
         Ok::<_, TlsInterceptError>((downstream, upstream))
     })
     .await
     .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
-    if required_alpn.is_some_and(|protocol| {
-        downstream.get_ref().1.alpn_protocol() != Some(protocol)
-            || upstream.get_ref().1.alpn_protocol() != Some(protocol)
+    if allowed_alpn.is_some_and(|_| {
+        downstream.get_ref().1.alpn_protocol() != upstream.get_ref().1.alpn_protocol()
     }) {
         return Err(TlsInterceptError::UnsupportedApplicationProtocol);
     }
     Ok(VerifiedTls {
+        protocol: upstream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec),
         downstream,
         upstream,
     })
@@ -487,7 +496,7 @@ mod tests {
             leaf,
             Arc::new(upstream_client),
             Duration::from_secs(2),
-            Some(HTTP1_ALPN),
+            Some(&[HTTP1_ALPN]),
         );
         let mut downstream_roots = RootCertStore::empty();
         downstream_roots
@@ -507,7 +516,7 @@ mod tests {
             client_side,
         );
         let (established, client) = tokio::join!(established, client);
-        assert!(client.is_ok());
+        assert!(client.is_err());
         assert!(matches!(
             established,
             Err(TlsInterceptError::UnsupportedApplicationProtocol)

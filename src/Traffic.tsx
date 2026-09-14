@@ -62,7 +62,7 @@ export function Traffic({
           HTTP metadata + optional body inspection · JSON requests are redacted
           before storage ·{" "}
           {snapshot?.status.httpsInspection
-            ? "Development TLS termination and persistent HTTP/1 capture are enabled."
+            ? "Development TLS termination with HTTP/1.1 and HTTP/2 capture is enabled."
             : "HTTPS content stays in opaque tunnels; the CA is never installed automatically."}
         </p>
       </div>
@@ -205,7 +205,8 @@ export function Traffic({
               <p className="capture-notice">
                 HTTPS was terminated only for this authorized Development
                 destination and separately verified upstream. The inner HTTP/1
-                exchange uses the same capture and redaction rules as HTTP.
+                exchange uses the same capture and redaction rules as HTTP,
+                including multiplexed HTTP/2 streams.
               </p>
             )}
             <div className="detail-tabs" aria-label="Inspector view">
@@ -292,7 +293,7 @@ export function Traffic({
             )}
             <p>
               {selected.kind === "https"
-                ? "Only the authorized inner HTTP/1 exchange is inspected; TLS records are not retained. "
+                ? "Only authorized inner HTTP exchanges are inspected; TLS records are not retained. "
                 : "Encrypted tunnel contents are not recorded. "}
               HTTP body recording must be enabled before Start; request
               inspection currently accepts JSON up to 1 MiB and stores only its

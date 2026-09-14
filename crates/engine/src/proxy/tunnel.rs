@@ -117,7 +117,7 @@ impl Tunnel {
                 route.leaf,
                 route.upstream_config,
                 handshake_timeout,
-                Some(HTTP1_ALPN),
+                Some(&INSPECTION_ALPN),
             )
             .await
             {
@@ -133,19 +133,40 @@ impl Tunnel {
                     return;
                 }
             };
-            let (sender, connection) =
+            let http2 = established.protocol.as_deref() == Some(HTTP2_ALPN);
+            let (sender, upstream_connection) = if http2 {
+                let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+                builder
+                    .max_header_list_size(32 * 1024)
+                    .max_concurrent_streams(16_u32);
+                match builder.handshake(TokioIo::new(established.upstream)).await {
+                    Ok((sender, connection)) => (
+                        UpstreamSender::Http2(sender),
+                        tokio::spawn(async move {
+                            let _ = connection.await;
+                        }),
+                    ),
+                    Err(_) => {
+                        exchange.finish(Some("Upstream HTTPS HTTP/2 handshake failed."));
+                        return;
+                    }
+                }
+            } else {
                 match hyper::client::conn::http1::handshake(TokioIo::new(established.upstream))
                     .await
                 {
-                    Ok(parts) => parts,
+                    Ok((sender, connection)) => (
+                        UpstreamSender::Http1(sender),
+                        tokio::spawn(async move {
+                            let _ = connection.await;
+                        }),
+                    ),
                     Err(_) => {
                         exchange.finish(Some("Upstream HTTPS HTTP/1 handshake failed."));
                         return;
                     }
-                };
-            let upstream_connection = tokio::spawn(async move {
-                let _ = connection.await;
-            });
+                }
+            };
             let sender = Arc::new(tokio::sync::Mutex::new(sender));
             let first_request = Arc::new(AtomicBool::new(true));
             let service_exchange = exchange.clone();
@@ -165,7 +186,13 @@ impl Tunnel {
                 async move {
                     let result = timeout(
                         handshake_timeout,
-                        forward_intercepted_https(request, exchange.clone(), sender, authority),
+                        forward_intercepted_https(
+                            request,
+                            exchange.clone(),
+                            sender,
+                            authority,
+                            http2,
+                        ),
                     )
                     .await
                     .unwrap_or(Err((
@@ -182,18 +209,32 @@ impl Tunnel {
                     })
                 }
             });
-            let mut builder = http1::Builder::new();
-            builder
-                .keep_alive(true)
-                .max_buf_size(32 * 1024)
-                .timer(TokioTimer::new())
-                .header_read_timeout(handshake_timeout);
-            match timeout(
-                lifetime,
-                builder.serve_connection(TokioIo::new(established.downstream), service),
-            )
-            .await
-            {
+            let served = if http2 {
+                let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+                builder
+                    .max_concurrent_streams(16_u32)
+                    .max_header_list_size(32 * 1024)
+                    .max_send_buf_size(256 * 1024)
+                    .timer(TokioTimer::new());
+                timeout(
+                    lifetime,
+                    builder.serve_connection(TokioIo::new(established.downstream), service),
+                )
+                .await
+            } else {
+                let mut builder = http1::Builder::new();
+                builder
+                    .keep_alive(true)
+                    .max_buf_size(32 * 1024)
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(handshake_timeout);
+                timeout(
+                    lifetime,
+                    builder.serve_connection(TokioIo::new(established.downstream), service),
+                )
+                .await
+            };
+            match served {
                 Ok(Ok(())) => exchange.finish(Some(
                     "The HTTPS connection ended before a complete HTTP exchange.",
                 )),
@@ -229,8 +270,9 @@ impl Tunnel {
 async fn forward_intercepted_https(
     request: Request<Incoming>,
     exchange: Arc<Exchange>,
-    sender: Arc<tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<RequestBody>>>,
+    sender: Arc<tokio::sync::Mutex<UpstreamSender>>,
     authority: Authority,
+    http2: bool,
 ) -> Result<Response<WireBody>, ForwardError> {
     if request.headers().contains_key("upgrade") {
         return Err((
@@ -238,7 +280,12 @@ async fn forward_intercepted_https(
             "HTTPS protocol upgrades are not supported.",
         ));
     }
-    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+    let absolute_target_is_valid = http2
+        && request.uri().scheme_str() == Some("https")
+        && request.uri().authority() == Some(&authority);
+    if (request.uri().scheme().is_some() || request.uri().authority().is_some())
+        && !absolute_target_is_valid
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "An origin-form HTTPS request target is required inside CONNECT.",
