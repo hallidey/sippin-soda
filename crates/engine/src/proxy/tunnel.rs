@@ -117,10 +117,17 @@ impl Tunnel {
                 route.leaf,
                 route.upstream_config,
                 handshake_timeout,
+                Some(HTTP1_ALPN),
             )
             .await
             {
                 Ok(established) => established,
+                Err(TlsInterceptError::UnsupportedApplicationProtocol) => {
+                    exchange.finish(Some(
+                        "TLS peers did not negotiate the required HTTP/1.1 protocol.",
+                    ));
+                    return;
+                }
                 Err(_) => {
                     exchange.finish(Some("Verified TLS handshakes failed."));
                     return;

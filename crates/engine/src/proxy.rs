@@ -1,6 +1,7 @@
 use crate::{
     establish_verified_tls_with_config, platform_tls_client_config, CaManager, DestinationClass,
-    EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsTrustCheckManager,
+    EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInterceptError,
+    TlsTrustCheckManager, HTTP1_ALPN,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 mod bodies;
@@ -1542,22 +1543,23 @@ mod tls_listener_tests {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef";
         let upstream_identity =
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
-        let upstream_server_config = ServerConfig::builder()
+        let mut upstream_server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![upstream_identity.cert.der().clone()],
                 PrivatePkcs8KeyDer::from(upstream_identity.signing_key.serialize_der()).into(),
             )
             .unwrap();
+        upstream_server_config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
         let mut upstream_roots = RootCertStore::empty();
         upstream_roots
             .add(upstream_identity.cert.der().clone())
             .unwrap();
-        let upstream_client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(upstream_roots)
-                .with_no_client_auth(),
-        );
+        let mut upstream_client_config = ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth();
+        upstream_client_config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let upstream_client_config = Arc::new(upstream_client_config);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_port = listener.local_addr().unwrap().port();
         let upstream = tokio::spawn(async move {
@@ -1566,6 +1568,7 @@ mod tls_listener_tests {
                 .accept(socket)
                 .await
                 .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP1_ALPN));
             let request = http_message(&mut tls).await;
             assert!(request.starts_with("POST /submit?token=secret HTTP/1.1\r\n"));
             let lowercase_request = request.to_ascii_lowercase();
@@ -1626,14 +1629,15 @@ mod tls_listener_tests {
                     .unwrap(),
             )
             .unwrap();
-        let mut tls = TlsConnector::from(Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(downstream_roots)
-                .with_no_client_auth(),
-        ))
-        .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
-        .await
-        .unwrap();
+        let mut downstream_config = ClientConfig::builder()
+            .with_root_certificates(downstream_roots)
+            .with_no_client_auth();
+        downstream_config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let mut tls = TlsConnector::from(Arc::new(downstream_config))
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP1_ALPN));
         let body = r#"{"password":"secret","value":"safe"}"#;
         tls.write_all(
             format!(

@@ -21,9 +21,12 @@ pub enum TlsInterceptError {
     HandshakeTimeout,
     DownstreamHandshake,
     UpstreamVerification,
+    UnsupportedApplicationProtocol,
     Transport,
     LifetimeExceeded,
 }
+
+pub(crate) const HTTP1_ALPN: &[u8] = b"http/1.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsBridgeResult {
@@ -285,7 +288,11 @@ where
 pub(crate) fn platform_tls_client_config() -> Result<Arc<ClientConfig>, String> {
     ClientConfig::builder()
         .with_platform_verifier()
-        .map(|builder| Arc::new(builder.with_no_client_auth()))
+        .map(|builder| {
+            let mut config = builder.with_no_client_auth();
+            config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+            Arc::new(config)
+        })
         .map_err(|_| "Cannot initialize platform TLS certificate verification.".into())
 }
 
@@ -308,6 +315,7 @@ where
         leaf,
         client_config,
         handshake_timeout,
+        None,
     )
     .await?;
     let (downstream_reader, downstream_writer) = tokio::io::split(established.downstream);
@@ -341,19 +349,23 @@ pub(crate) async fn establish_verified_tls_with_config<C>(
     leaf: IssuedLeaf,
     client_config: Arc<ClientConfig>,
     handshake_timeout: Duration,
+    required_alpn: Option<&[u8]>,
 ) -> Result<VerifiedTls<C>, TlsInterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     let upstream_name = ServerName::try_from(upstream_name.to_owned())
         .map_err(|_| TlsInterceptError::InvalidUpstreamName)?;
-    let server = ServerConfig::builder()
+    let mut server = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(leaf.certificate_der)],
             PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
         )
         .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
+    if let Some(protocol) = required_alpn {
+        server.alpn_protocols = vec![protocol.to_vec()];
+    }
     let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
     let verified_upstream = TlsConnector::from(client_config).connect(upstream_name, upstream);
     let (downstream, upstream) = tokio::time::timeout(handshake_timeout, async {
@@ -367,6 +379,12 @@ where
     })
     .await
     .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
+    if required_alpn.is_some_and(|protocol| {
+        downstream.get_ref().1.alpn_protocol() != Some(protocol)
+            || upstream.get_ref().1.alpn_protocol() != Some(protocol)
+    }) {
+        return Err(TlsInterceptError::UnsupportedApplicationProtocol);
+    }
     Ok(VerifiedTls {
         downstream,
         upstream,
@@ -436,6 +454,66 @@ mod tests {
             stream,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn required_application_protocol_rejects_missing_upstream_alpn() {
+        let (upstream_identity, upstream_server) = upstream_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(Arc::new(upstream_server))
+                .accept(socket)
+                .await
+                .unwrap()
+        });
+        let upstream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut upstream_roots = RootCertStore::empty();
+        upstream_roots
+            .add(upstream_identity.cert.der().clone())
+            .unwrap();
+        let mut upstream_client = ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth();
+        upstream_client.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+
+        let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("client.dev.test");
+        let (server_side, client_side) = tokio::io::duplex(16 * 1024);
+        let established = establish_verified_tls_with_config(
+            server_side,
+            upstream,
+            "upstream.dev.test",
+            leaf,
+            Arc::new(upstream_client),
+            Duration::from_secs(2),
+            Some(HTTP1_ALPN),
+        );
+        let mut downstream_roots = RootCertStore::empty();
+        downstream_roots
+            .add(
+                rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut downstream_client = ClientConfig::builder()
+            .with_root_certificates(downstream_roots)
+            .with_no_client_auth();
+        downstream_client.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let client = TlsConnector::from(Arc::new(downstream_client)).connect(
+            ServerName::try_from("client.dev.test").unwrap(),
+            client_side,
+        );
+        let (established, client) = tokio::join!(established, client);
+        assert!(client.is_ok());
+        assert!(matches!(
+            established,
+            Err(TlsInterceptError::UnsupportedApplicationProtocol)
+        ));
+        let upstream = upstream_task.await.unwrap();
+        assert_eq!(upstream.get_ref().1.alpn_protocol(), None);
     }
 
     #[test]
