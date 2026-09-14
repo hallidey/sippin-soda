@@ -1,5 +1,5 @@
 use crate::{
-    bridge_verified_tls_with_config, platform_tls_client_config, CaManager, DestinationClass,
+    establish_verified_tls_with_config, platform_tls_client_config, CaManager, DestinationClass,
     EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsTrustCheckManager,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -11,6 +11,7 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Body, Bytes, Frame, Incoming, SizeHint},
     header::{HeaderMap, HeaderValue, HOST},
+    http::uri::Authority,
     server::conn::http1,
     service::service_fn,
     Method, Request, Response, StatusCode,
@@ -30,6 +31,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::{JoinHandle, JoinSet},
@@ -1144,7 +1146,7 @@ async fn handle(
 type ForwardError = (StatusCode, &'static str);
 
 async fn forward(
-    mut request: Request<Incoming>,
+    request: Request<Incoming>,
     exchange: Arc<Exchange>,
     proxy: SocketAddr,
 ) -> Result<Response<WireBody>, ForwardError> {
@@ -1176,6 +1178,18 @@ async fn forward(
         .to_string();
     let port = request.uri().port_u16().unwrap_or(80);
     let stream = connect_upstream(&host, port, proxy).await?;
+    forward_connected(request, exchange, stream, authority).await
+}
+
+async fn forward_connected<S>(
+    mut request: Request<Incoming>,
+    exchange: Arc<Exchange>,
+    stream: S,
+    authority: Authority,
+) -> Result<Response<WireBody>, ForwardError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP handshake failed."))?;
@@ -1470,7 +1484,7 @@ mod tls_listener_tests {
     }
 
     #[tokio::test]
-    async fn authenticated_development_connect_uses_the_verified_tls_bridge() {
+    async fn authenticated_development_connect_captures_inner_http_safely() {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef";
         let upstream_identity =
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
@@ -1498,10 +1512,38 @@ mod tls_listener_tests {
                 .accept(socket)
                 .await
                 .unwrap();
-            let mut request = [0; 5];
-            tls.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"hello");
-            tls.write_all(b"world").await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                request.push(tls.read_u8().await.unwrap());
+            }
+            let headers_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8(request[..headers_end].to_vec()).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap();
+            request.resize(headers_end + content_length, 0);
+            tls.read_exact(&mut request[headers_end..]).await.unwrap();
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /submit?token=secret HTTP/1.1\r\n"));
+            let lowercase_request = request.to_ascii_lowercase();
+            assert!(lowercase_request.contains(&format!("host: 127.0.0.1:{upstream_port}\r\n")));
+            assert!(!lowercase_request.contains("proxy-authorization"));
+            assert!(request.contains(r#"{"password":"secret","value":"safe"}"#));
+            tls.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
             tls.shutdown().await.unwrap();
         });
 
@@ -1512,6 +1554,7 @@ mod tls_listener_tests {
                 port: 0,
                 client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
                 tls_interception: Some(test_interception(leaf, upstream_client_config)),
+                capture_bodies: true,
                 ..Default::default()
             })
             .await
@@ -1548,26 +1591,64 @@ mod tls_listener_tests {
         .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
         .await
         .unwrap();
-        tls.write_all(b"hello").await.unwrap();
+        let body = r#"{"password":"secret","value":"safe"}"#;
+        tls.write_all(
+            format!(
+                "POST /submit?token=secret HTTP/1.1\r\nHost: wrong.example\r\nAuthorization: Bearer inner-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
         tls.flush().await.unwrap();
-        let mut reply = [0; 5];
-        tls.read_exact(&mut reply).await.unwrap();
-        assert_eq!(&reply, b"world");
-        tls.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        tls.read_to_end(&mut reply).await.unwrap();
+        let reply = String::from_utf8(reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 201 Created"));
+        assert!(reply.ends_with(r#"{"ok":true}"#));
         upstream.await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while engine.snapshot().traffic[0].phase == "pending" {
+            while {
+                let capture = &engine.snapshot().traffic[0];
+                capture.phase == "pending" || capture.request_body_state == "recording"
+            } {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+        let snapshot = engine.snapshot();
+        let capture_id = snapshot.traffic[0].id;
+        let request_body = engine.request_body_page(capture_id, 0, 1024).await.unwrap();
+        let response_body = engine
+            .response_body_page(capture_id, 0, 1024)
+            .await
+            .unwrap();
         let snapshot = engine.stop().await;
         assert!(!snapshot.status.https_inspection);
         let capture = &snapshot.traffic[0];
-        assert_eq!(capture.kind, "tls");
-        assert_eq!(capture.request_bytes, 5);
-        assert_eq!(capture.response_bytes, 5);
+        assert_eq!(capture.kind, "https");
+        assert_eq!(capture.method, "POST");
+        assert_eq!(
+            capture.target,
+            format!("127.0.0.1:{upstream_port}/submit?[REDACTED]")
+        );
+        assert_eq!(capture.status, Some(201));
+        assert_eq!(capture.request_bytes, body.len() as u64);
+        assert_eq!(capture.response_bytes, 11);
+        assert!(capture
+            .request_headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && value == "[REDACTED]"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request_body.bytes).unwrap(),
+            serde_json::json!({"password": "[REDACTED]", "value": "safe"})
+        );
+        assert_eq!(
+            String::from_utf8(response_body.bytes).unwrap(),
+            r#"{"ok":true}"#
+        );
         assert_eq!(capture.phase, "complete");
     }
 

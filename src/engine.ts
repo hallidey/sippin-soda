@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 
 export type Capture = {
   id: number;
-  kind: "http" | "tunnel" | "tls";
+  kind: "http" | "https" | "tunnel" | "tls";
   method: string;
   target: string;
   destinationClass: "development" | "production" | "unknown";

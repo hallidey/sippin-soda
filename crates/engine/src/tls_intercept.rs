@@ -301,30 +301,17 @@ pub(crate) async fn bridge_verified_tls_with_config<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let upstream_name = ServerName::try_from(upstream_name.to_owned())
-        .map_err(|_| TlsInterceptError::InvalidUpstreamName)?;
-    let server = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(leaf.certificate_der)],
-            PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
-        )
-        .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
-    let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
-    let verified_upstream = TlsConnector::from(client_config).connect(upstream_name, upstream);
-    let (downstream, verified_upstream) = tokio::time::timeout(handshake_timeout, async {
-        let upstream = verified_upstream
-            .await
-            .map_err(|_| TlsInterceptError::UpstreamVerification)?;
-        let downstream = downstream
-            .await
-            .map_err(|_| TlsInterceptError::DownstreamHandshake)?;
-        Ok::<_, TlsInterceptError>((downstream, upstream))
-    })
-    .await
-    .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
-    let (downstream_reader, downstream_writer) = tokio::io::split(downstream);
-    let (upstream_reader, upstream_writer) = tokio::io::split(verified_upstream);
+    let established = establish_verified_tls_with_config(
+        client,
+        upstream,
+        upstream_name,
+        leaf,
+        client_config,
+        handshake_timeout,
+    )
+    .await?;
+    let (downstream_reader, downstream_writer) = tokio::io::split(established.downstream);
+    let (upstream_reader, upstream_writer) = tokio::io::split(established.upstream);
     let transfer = async {
         tokio::try_join!(
             copy_with_flush(downstream_reader, upstream_writer),
@@ -339,6 +326,50 @@ where
     Ok(TlsBridgeResult {
         client_to_upstream_bytes,
         upstream_to_client_bytes,
+    })
+}
+
+pub(crate) struct VerifiedTls<C> {
+    pub(crate) downstream: tokio_rustls::server::TlsStream<C>,
+    pub(crate) upstream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+}
+
+pub(crate) async fn establish_verified_tls_with_config<C>(
+    client: C,
+    upstream: tokio::net::TcpStream,
+    upstream_name: &str,
+    leaf: IssuedLeaf,
+    client_config: Arc<ClientConfig>,
+    handshake_timeout: Duration,
+) -> Result<VerifiedTls<C>, TlsInterceptError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let upstream_name = ServerName::try_from(upstream_name.to_owned())
+        .map_err(|_| TlsInterceptError::InvalidUpstreamName)?;
+    let server = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(leaf.certificate_der)],
+            PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
+        )
+        .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
+    let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
+    let verified_upstream = TlsConnector::from(client_config).connect(upstream_name, upstream);
+    let (downstream, upstream) = tokio::time::timeout(handshake_timeout, async {
+        let upstream = verified_upstream
+            .await
+            .map_err(|_| TlsInterceptError::UpstreamVerification)?;
+        let downstream = downstream
+            .await
+            .map_err(|_| TlsInterceptError::DownstreamHandshake)?;
+        Ok::<_, TlsInterceptError>((downstream, upstream))
+    })
+    .await
+    .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
+    Ok(VerifiedTls {
+        downstream,
+        upstream,
     })
 }
 

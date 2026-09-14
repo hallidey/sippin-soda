@@ -7,6 +7,7 @@ pub(super) struct Tunnel {
     upstream: TcpStream,
     exchange: Arc<Exchange>,
     interception: Option<TlsInterceptRoute>,
+    authority: Authority,
 }
 
 pub(super) async fn establish(
@@ -24,6 +25,7 @@ pub(super) async fn establish(
     );
     let uri = request.uri();
     let authority = uri.authority().ok_or(invalid)?;
+    let authority = authority.clone();
     if uri.scheme().is_some() || uri.path_and_query().is_some() || authority.as_str().contains('@')
     {
         return Err(invalid);
@@ -76,6 +78,7 @@ pub(super) async fn establish(
             upstream,
             exchange,
             interception,
+            authority,
         })
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Proxy is stopping."))?;
     let mut result = response(StatusCode::OK, "");
@@ -90,6 +93,7 @@ impl Tunnel {
             upstream,
             exchange,
             interception,
+            authority,
         } = self;
         let upgraded = match timeout(handshake_timeout, upgrade).await {
             Ok(Ok(io)) => io,
@@ -99,25 +103,59 @@ impl Tunnel {
             }
         };
         if let Some(route) = interception {
-            match bridge_verified_tls_with_config(
+            let established = match establish_verified_tls_with_config(
                 TokioIo::new(upgraded),
                 upstream,
                 &route.host,
                 route.leaf,
                 route.upstream_config,
                 handshake_timeout,
-                lifetime,
             )
             .await
             {
-                Ok(result) => {
-                    exchange.update(|capture| {
-                        capture.request_bytes = result.client_to_upstream_bytes;
-                        capture.response_bytes = result.upstream_to_client_bytes;
-                    });
-                    exchange.finish(None);
+                Ok(established) => established,
+                Err(_) => {
+                    exchange.finish(Some("Verified TLS handshakes failed."));
+                    return;
                 }
-                Err(_) => exchange.finish(Some("Verified TLS bridge failed.")),
+            };
+            let upstream = Arc::new(Mutex::new(Some(established.upstream)));
+            let service_exchange = exchange.clone();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let exchange = service_exchange.clone();
+                let upstream = upstream.clone();
+                let authority = authority.clone();
+                async move {
+                    let result =
+                        forward_intercepted_https(request, exchange.clone(), upstream, authority)
+                            .await;
+                    Ok::<_, Infallible>(match result {
+                        Ok(response) => response,
+                        Err((status, message)) => {
+                            exchange.update(|capture| capture.status = Some(status.as_u16()));
+                            exchange.finish(Some(message));
+                            response(status, message)
+                        }
+                    })
+                }
+            });
+            let mut builder = http1::Builder::new();
+            builder
+                .keep_alive(false)
+                .max_buf_size(32 * 1024)
+                .timer(TokioTimer::new())
+                .header_read_timeout(handshake_timeout);
+            match timeout(
+                lifetime,
+                builder.serve_connection(TokioIo::new(established.downstream), service),
+            )
+            .await
+            {
+                Ok(Ok(())) => exchange.finish(Some(
+                    "The HTTPS connection ended before a complete HTTP exchange.",
+                )),
+                Ok(Err(_)) => exchange.finish(Some("Inner HTTPS HTTP/1 transfer failed.")),
+                Err(_) => exchange.finish(Some("Tunnel lifetime limit reached.")),
             }
             return;
         }
@@ -142,6 +180,53 @@ impl Tunnel {
             Err(_) => exchange.finish(Some("Tunnel lifetime limit reached.")),
         }
     }
+}
+
+async fn forward_intercepted_https<U>(
+    request: Request<Incoming>,
+    exchange: Arc<Exchange>,
+    upstream: Arc<Mutex<Option<U>>>,
+    authority: Authority,
+) -> Result<Response<WireBody>, ForwardError>
+where
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if request.headers().contains_key("upgrade") {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "HTTPS protocol upgrades are not supported.",
+        ));
+    }
+    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "An origin-form HTTPS request target is required inside CONNECT.",
+        ));
+    }
+    let target = format!(
+        "{}{}{}",
+        clipped(authority.as_str(), 256),
+        clipped(request.uri().path(), 1024),
+        if request.uri().query().is_some() {
+            "?[REDACTED]"
+        } else {
+            ""
+        }
+    );
+    exchange.update(|capture| {
+        capture.kind = "https".into();
+        capture.method = request.method().to_string();
+        capture.target = target;
+        capture.status = None;
+        capture.request_headers = safe_headers(request.headers());
+        capture.response_headers.clear();
+    });
+    exchange.shared.lock().unwrap().revision += 1;
+    let stream = upstream.lock().unwrap().take().ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Only one HTTP/1 request is supported per inspected CONNECT tunnel.",
+    ))?;
+    forward_connected(request, exchange, stream, authority).await
 }
 
 /// Count bytes accepted by the opposite transport, without retaining payload.

@@ -62,8 +62,8 @@ export function Traffic({
           HTTP metadata + optional body inspection · JSON requests are redacted
           before storage ·{" "}
           {snapshot?.status.httpsInspection
-            ? "Development TLS termination is enabled; inner HTTP capture is not implemented yet."
-            : "HTTPS content stays encrypted; no CA is installed."}
+            ? "Development TLS termination and one-request HTTP/1 capture are enabled."
+            : "HTTPS content stays in opaque tunnels; the CA is never installed automatically."}
         </p>
       </div>
       <div className="traffic-toolbar">
@@ -197,9 +197,15 @@ export function Traffic({
             )}
             {selected.kind === "tls" && (
               <p className="capture-notice">
-                Development TLS was terminated and separately verified upstream.
-                Byte counts describe forwarded plaintext, but inner HTTP
-                metadata and bodies are not captured in this increment.
+                Development TLS inspection was selected, but no complete inner
+                HTTP/1 request was captured. Check the transfer error below.
+              </p>
+            )}
+            {selected.kind === "https" && (
+              <p className="capture-notice">
+                HTTPS was terminated only for this authorized Development
+                destination and separately verified upstream. The inner HTTP/1
+                exchange uses the same capture and redaction rules as HTTP.
               </p>
             )}
             <div className="detail-tabs" aria-label="Inspector view">
@@ -224,7 +230,7 @@ export function Traffic({
                   {selected.requestBytes.toLocaleString()} bytes forwarded.
                   Query values and non-allowlisted header values are redacted.
                 </p>
-                {selected.kind !== "http" && (
+                {(selected.kind === "tunnel" || selected.kind === "tls") && (
                   <p>CONNECT negotiation headers only.</p>
                 )}
                 <Headers values={selected.requestHeaders} />
@@ -255,7 +261,7 @@ export function Traffic({
                   {selected.status ?? "Waiting"} ·{" "}
                   {selected.responseBytes.toLocaleString()} bytes received
                 </p>
-                {selected.kind === "tunnel" ? (
+                {selected.kind === "tunnel" || selected.kind === "tls" ? (
                   <p>Inner response headers are not available.</p>
                 ) : (
                   <>
@@ -285,8 +291,8 @@ export function Traffic({
               </dl>
             )}
             <p>
-              {selected.kind === "tls"
-                ? "Terminated TLS plaintext is forwarded without HTTP content recording in this increment. "
+              {selected.kind === "https"
+                ? "Only the authorized inner HTTP/1 exchange is inspected; TLS records are not retained. "
                 : "Encrypted tunnel contents are not recorded. "}
               HTTP body recording must be enabled before Start; request
               inspection currently accepts JSON up to 1 MiB and stores only its
