@@ -758,6 +758,7 @@ mod tests {
         payload_bytes: usize,
         samples: usize,
         concurrency: usize,
+        http2_streams: usize,
     }
 
     struct BenchmarkModeResult {
@@ -779,6 +780,7 @@ mod tests {
             payload_bytes: benchmark_setting("SIPPIN_BENCH_PAYLOAD_MIB", 1, 1, 64) * 1024 * 1024,
             samples: benchmark_setting("SIPPIN_BENCH_SAMPLES", 20, 3, 500),
             concurrency: benchmark_setting("SIPPIN_BENCH_CONCURRENCY", 4, 1, 64),
+            http2_streams: benchmark_setting("SIPPIN_BENCH_H2_STREAMS", 8, 1, 64),
         }
     }
 
@@ -911,6 +913,86 @@ mod tests {
         elapsed
     }
 
+    async fn http2_tls_sample(
+        payload: Arc<Vec<u8>>,
+        identity: BenchmarkIdentity,
+        streams: usize,
+    ) -> Duration {
+        use http_body_util::{BodyExt, Full};
+        use hyper::{body::Bytes, service::service_fn, Request, Response};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.certificate.clone()],
+                PrivatePkcs8KeyDer::from(identity.private_key.clone()).into(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let tls = TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            let service = service_fn(|request: Request<hyper::body::Incoming>| async move {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                Ok::<_, std::convert::Infallible>(Response::new(Full::new(body)))
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await;
+        });
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.certificate).unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let started = std::time::Instant::now();
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let tls = TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("upstream.dev.test").unwrap(), socket)
+            .await
+            .unwrap();
+        let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        let connection = tokio::spawn(connection);
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..streams {
+            let mut sender = sender.clone();
+            let payload = payload.clone();
+            requests.spawn(async move {
+                let request = Request::post("https://upstream.dev.test/benchmark")
+                    .body(Full::new(Bytes::copy_from_slice(&payload)))
+                    .unwrap();
+                sender
+                    .send_request(request)
+                    .await
+                    .unwrap()
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert_eq!(result.unwrap().as_ref(), payload.as_slice());
+        }
+        let elapsed = started.elapsed();
+        connection.abort();
+        server.abort();
+        elapsed
+    }
+
     async fn measure_mode<F, Fut>(config: BenchmarkConfig, sample: F) -> BenchmarkModeResult
     where
         F: Fn() -> Fut + Clone + Send + 'static,
@@ -979,8 +1061,12 @@ mod tests {
     fn benchmark_report(
         config: BenchmarkConfig,
         result: &BenchmarkModeResult,
+        payload_multiplier: usize,
     ) -> serde_json::Value {
-        let transferred = (config.payload_bytes as f64) * (config.samples as f64) * 2.0;
+        let transferred = (config.payload_bytes as f64)
+            * (config.samples as f64)
+            * (payload_multiplier as f64)
+            * 2.0;
         serde_json::json!({
             "wallMs": result.wall_time.as_secs_f64() * 1000.0,
             "p50Micros": percentile(&result.samples, 50),
@@ -1010,6 +1096,14 @@ mod tests {
             async move { tls_sample(payload, upstream, downstream).await }
         })
         .await;
+        let http2_identity = benchmark_identity("upstream.dev.test");
+        let http2_payload = Arc::new(vec![0x5a; config.payload_bytes]);
+        let http2 = measure_mode(config, move || {
+            let payload = http2_payload.clone();
+            let identity = http2_identity.clone();
+            async move { http2_tls_sample(payload, identity, config.http2_streams).await }
+        })
+        .await;
         let mut system = sysinfo::System::new_all();
         system.refresh_cpu_all();
         let report = serde_json::json!({
@@ -1027,9 +1121,11 @@ mod tests {
                 "concurrency": config.concurrency,
                 "tlsIncludesHandshake": true,
                 "connectionTeardownIncluded": false,
+                "http2StreamsPerConnection": config.http2_streams,
             },
-            "passThrough": benchmark_report(config, &pass_through),
-            "verifiedTlsBridge": benchmark_report(config, &tls),
+            "passThrough": benchmark_report(config, &pass_through, 1),
+            "verifiedTlsBridge": benchmark_report(config, &tls, 1),
+            "http2TlsMultiplexBaseline": benchmark_report(config, &http2, config.http2_streams),
             "tlsP50OverheadPercent": (percentile(&tls.samples, 50) / percentile(&pass_through.samples, 50) - 1.0) * 100.0,
         });
         println!("SIPPIN_TLS_BENCHMARK={report}");
