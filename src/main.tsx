@@ -48,6 +48,9 @@ type ResponseRule = {
   pathPrefix: string;
   method: "*" | "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
   status: number;
+  replaceBody: boolean;
+  body: string;
+  contentType: string;
 };
 type TlsInspectionPreflight = {
   state:
@@ -108,7 +111,17 @@ function loadResponseRules(): ResponseRule[] {
             (rule as ResponseRule).method,
           ) &&
           typeof (rule as ResponseRule).status === "number",
-      );
+      )
+      .map((rule) => ({
+        ...rule,
+        replaceBody:
+          typeof rule.replaceBody === "boolean" ? rule.replaceBody : false,
+        body: typeof rule.body === "string" ? rule.body : "",
+        contentType:
+          typeof rule.contentType === "string"
+            ? rule.contentType
+            : "application/json",
+      }));
   } catch {
     return [];
   }
@@ -229,7 +242,12 @@ function App() {
         Number.isInteger(rule.status) &&
         rule.status >= 200 &&
         rule.status <= 599 &&
-        ![204, 205, 304].includes(rule.status),
+        ![204, 205, 304].includes(rule.status) &&
+        (!rule.replaceBody ||
+          (new TextEncoder().encode(rule.body).length <= 65536 &&
+            rule.contentType.trim().length >= 1 &&
+            rule.contentType.length <= 128 &&
+            !/[\r\n]/.test(rule.contentType))),
     );
   const parsedRedactionPaths = redactionPaths
     .split(/[\n,]/)
@@ -298,8 +316,15 @@ function App() {
         enableHttpsInspection,
         breakOnResponses,
         responseRules: responseRules.map((rule) => ({
-          ...rule,
+          id: rule.id,
+          name: rule.name,
+          enabled: rule.enabled,
+          host: rule.host,
+          pathPrefix: rule.pathPrefix,
           method: rule.method === "*" ? null : rule.method,
+          status: rule.status,
+          body: rule.replaceBody ? rule.body : null,
+          contentType: rule.replaceBody ? rule.contentType : null,
         })),
       },
     });
@@ -479,6 +504,9 @@ function App() {
         pathPrefix: "/",
         method: "GET",
         status: 503,
+        replaceBody: false,
+        body: '{\n  "error": "service unavailable"\n}',
+        contentType: "application/json",
       },
     ]);
   };
@@ -849,7 +877,8 @@ function App() {
               <p className="error" role="alert">
                 Every rule needs a name, a valid exact/wildcard host, a path
                 beginning with / and a body-compatible status from 200 to 599
-                (not 204, 205 or 304).
+                (not 204, 205 or 304). Replacement bodies must be valid header
+                metadata and no larger than 64 KiB.
               </p>
             )}
             {responseRules.length ? (
@@ -957,6 +986,51 @@ function App() {
                         />
                       </label>
                     </div>
+                    <div className="rule-body-action">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={rule.replaceBody}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              replaceBody: event.target.checked,
+                            })
+                          }
+                        />{" "}
+                        Replace response body
+                      </label>
+                      {rule.replaceBody && (
+                        <div className="rule-body-fields">
+                          <label>
+                            Content-Type
+                            <input
+                              value={rule.contentType}
+                              maxLength={128}
+                              disabled={running}
+                              onChange={(event) =>
+                                updateResponseRule(rule.id, {
+                                  contentType: event.target.value,
+                                })
+                              }
+                            />
+                          </label>
+                          <label>
+                            UTF-8 body (max 64 KiB)
+                            <textarea
+                              rows={6}
+                              value={rule.body}
+                              disabled={running}
+                              onChange={(event) =>
+                                updateResponseRule(rule.id, {
+                                  body: event.target.value,
+                                })
+                              }
+                            />
+                          </label>
+                        </div>
+                      )}
+                    </div>
                     <div className="rule-actions">
                       <button
                         disabled={running || index === 0}
@@ -995,9 +1069,9 @@ function App() {
               </div>
             )}
             <p className="muted rules-footnote">
-              Rules never run for Production or Unknown destinations. They
-              currently change only the status; the upstream headers and body
-              remain unchanged.
+              Rules never run for Production or Unknown destinations. They can
+              replace status and a bounded UTF-8 body; without body replacement,
+              upstream headers and content remain unchanged.
             </p>
           </div>
         ) : section === "Settings" ? (

@@ -178,7 +178,50 @@ fn response_rule(id: &str, name: &str, host: &str, path: &str, status: u16) -> R
         path_prefix: path.into(),
         method: Some("GET".into()),
         status,
+        body: None,
+        content_type: None,
     }
+}
+
+#[tokio::test]
+async fn development_response_rule_can_replace_and_record_a_bounded_body() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\nETag: old\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let mut rule = response_rule("mock", "Mock JSON", "127.0.0.1", "/mock", 502);
+    rule.body = Some("{\"mock\":true}".into());
+    rule.content_type = Some("application/json".into());
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            capture_bodies: true,
+            body_disk_budget: 1024 * 1024,
+            response_rules: vec![rule],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/mock HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 502"));
+    assert!(reply
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    assert!(!reply.to_ascii_lowercase().contains("content-encoding"));
+    assert!(!reply.to_ascii_lowercase().contains("etag:"));
+    assert!(reply.ends_with("{\"mock\":true}"));
+    let capture = engine.snapshot().traffic[0].clone();
+    let page = engine.response_body_page(capture.id, 0, 64).await.unwrap();
+    assert_eq!(page.bytes, b"{\"mock\":true}");
+    assert_eq!(capture.response_bytes, 13);
+    assert_eq!(capture.response_rule_id.as_deref(), Some("mock"));
+    engine.stop().await;
 }
 
 #[tokio::test]
@@ -222,6 +265,17 @@ async fn response_rules_validate_and_never_modify_production() {
         .start(ProxyConfig {
             port: 0,
             response_rules: vec![response_rule("bad", "Bad", "127.0.0.1", "api", 199)],
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    let mut oversized = response_rule("large", "Large", "127.0.0.1", "/", 500);
+    oversized.body = Some("x".repeat(65_537));
+    oversized.content_type = Some("text/plain".into());
+    assert!(engine
+        .start(ProxyConfig {
+            port: 0,
+            response_rules: vec![oversized],
             ..Default::default()
         })
         .await

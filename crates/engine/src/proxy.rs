@@ -97,6 +97,10 @@ pub struct ResponseRuleConfig {
     pub path_prefix: String,
     pub method: Option<String>,
     pub status: u16,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 type LeafIssuer =
@@ -469,6 +473,8 @@ struct ResponseRule {
     path_prefix: String,
     method: Option<Method>,
     status: StatusCode,
+    body: Option<Bytes>,
+    content_type: Option<HeaderValue>,
 }
 
 impl ResponseRule {
@@ -525,6 +531,11 @@ impl ResponseRule {
                         "Response rules cannot use body-forbidden status 204, 205 or 304.".into(),
                     );
                 }
+                let replacement = compile_replacement_body(
+                    config.body.as_deref(),
+                    config.content_type.as_deref(),
+                )?;
+                let (body, content_type) = replacement.unzip();
                 Ok(Self {
                     id: config.id.clone(),
                     name: name.into(),
@@ -532,6 +543,8 @@ impl ResponseRule {
                     path_prefix: config.path_prefix.clone(),
                     method,
                     status,
+                    body,
+                    content_type,
                 })
             })
             .collect()
@@ -563,6 +576,34 @@ struct BreakpointDecision {
     status: Option<StatusCode>,
     body: Option<Bytes>,
     content_type: Option<HeaderValue>,
+}
+
+fn compile_replacement_body(
+    body: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<Option<(Bytes, HeaderValue)>, String> {
+    let Some(body) = body else {
+        if content_type.is_some() {
+            return Err("Content-Type can be replaced only with a replacement body.".into());
+        }
+        return Ok(None);
+    };
+    if body.len() > 64 * 1024 {
+        return Err("Replacement body must be at most 65536 UTF-8 bytes.".into());
+    }
+    let content_type = content_type.unwrap_or("text/plain; charset=utf-8");
+    if content_type.trim().is_empty()
+        || content_type.len() > 128
+        || content_type.contains(['\r', '\n'])
+    {
+        return Err("Replacement Content-Type is invalid or longer than 128 bytes.".into());
+    }
+    let content_type = HeaderValue::from_str(content_type.trim())
+        .map_err(|_| "Replacement Content-Type is invalid or longer than 128 bytes.")?;
+    Ok(Some((
+        Bytes::copy_from_slice(body.as_bytes()),
+        content_type,
+    )))
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -677,22 +718,8 @@ impl ProxyEngine {
                     .ok_or("Replacement status must be between 200 and 599.")
             })
             .transpose()?;
-        let body = body.map(Bytes::from);
-        if body.as_ref().is_some_and(|body| body.len() > 64 * 1024) {
-            return Err("Replacement body must be at most 65536 UTF-8 bytes.".into());
-        }
-        if content_type.is_some() && body.is_none() {
-            return Err("Content-Type can be replaced only with a replacement body.".into());
-        }
-        let content_type = content_type
-            .map(|value| {
-                if value.trim().is_empty() || value.len() > 128 || value.contains(['\r', '\n']) {
-                    return Err("Replacement Content-Type is invalid or longer than 128 bytes.");
-                }
-                HeaderValue::from_str(value.trim())
-                    .map_err(|_| "Replacement Content-Type is invalid or longer than 128 bytes.")
-            })
-            .transpose()?;
+        let replacement = compile_replacement_body(body.as_deref(), content_type.as_deref())?;
+        let (body, content_type) = replacement.unzip();
         let sender = self
             .shared
             .lock()
@@ -1669,6 +1696,7 @@ async fn forward_with_sender(
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP request failed."))?;
     let (mut parts, body) = upstream.into_parts();
+    let mut replacement_body = None;
     let response_rule = {
         let state = exchange.shared.lock().unwrap();
         let can_modify = state
@@ -1689,6 +1717,7 @@ async fn forward_with_sender(
     if let Some(rule) = response_rule {
         let original_status = parts.status.as_u16();
         parts.status = rule.status;
+        replacement_body = rule.body.map(|body| (body, rule.content_type));
         exchange.update(|capture| {
             capture.original_status = Some(original_status);
             capture.response_rule_id = Some(rule.id);
@@ -1724,7 +1753,6 @@ async fn forward_with_sender(
             None
         }
     };
-    let mut replacement_body = None;
     if let Some(receiver) = breakpoint {
         let decision = timeout(Duration::from_secs(15), receiver).await;
         exchange
@@ -1738,8 +1766,11 @@ async fn forward_with_sender(
                 if let Some(status) = decision.status {
                     parts.status = status;
                 }
-                replacement_body = decision.body.map(|body| (body, decision.content_type));
-                let modified = decision.status.is_some() || replacement_body.is_some();
+                let body_modified = decision.body.is_some();
+                if let Some(body) = decision.body {
+                    replacement_body = Some((body, decision.content_type));
+                }
+                let modified = decision.status.is_some() || body_modified;
                 exchange.update(|capture| {
                     capture.breakpoint_state =
                         if modified { "modified" } else { "continued" }.into()
