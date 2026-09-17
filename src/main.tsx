@@ -79,10 +79,15 @@ type TlsInspectionPreflight = {
   verifiedClient: TlsClientProfile | null;
   proofExpiresAt: number | null;
 };
+type ConnectionCheckResult = {
+  proxyAddress: string;
+  httpStatus: number;
+};
 
 const clientProfilesKey = "sippin-tls-client-profiles";
 const responseRulesKey = "sippin-response-rules-v1";
 const workspaceSettingsKey = "sippin-workspace-settings-v1";
+const connectionSetupKey = "sippin-connection-setup-v1";
 const defaultWorkspaceSettings: WorkspaceSettings = {
   port: "8080",
   captureBodies: false,
@@ -202,6 +207,13 @@ function loadWorkspaceSettings(): WorkspaceSettings {
   }
 }
 const initialWorkspaceSettings = loadWorkspaceSettings();
+const connectionSetupComplete = () => {
+  try {
+    return localStorage.getItem(connectionSetupKey) === "complete";
+  } catch {
+    return false;
+  }
+};
 const descriptions: Record<Section, string> = {
   Traffic: "Your application’s traffic, in one place.",
   Collections: "Compose requests and keep repeatable workflows together.",
@@ -296,6 +308,14 @@ function App() {
   const [enableHttpsInspection, setEnableHttpsInspection] = useState(false);
   const [proxyCredential, setProxyCredential] =
     useState<ProxyCredential | null>(null);
+  const [showConnectionSetup, setShowConnectionSetup] = useState(
+    () => !connectionSetupComplete(),
+  );
+  const [connectionCheck, setConnectionCheck] =
+    useState<ConnectionCheckResult | null>(null);
+  const [connectionCheckBusy, setConnectionCheckBusy] = useState(false);
+  const [connectionSetupMessage, setConnectionSetupMessage] = useState("");
+  const [connectionSetupError, setConnectionSetupError] = useState(false);
   const [tlsPreflight, setTlsPreflight] =
     useState<TlsInspectionPreflight | null>(null);
   const selectedClient =
@@ -389,6 +409,9 @@ function App() {
   };
 
   const proxyCommand = async () => {
+    setConnectionCheck(null);
+    setConnectionSetupMessage("");
+    setConnectionSetupError(false);
     if (running) {
       if (await command("stop_proxy")) setProxyCredential(null);
       return;
@@ -423,6 +446,64 @@ function App() {
       },
     });
     setProxyCredential(started ? credential : null);
+  };
+
+  const copyProxyAddress = async () => {
+    const address = status?.listenAddress ?? `127.0.0.1:${port}`;
+    try {
+      await navigator.clipboard.writeText(address);
+      setConnectionSetupError(false);
+      setConnectionSetupMessage(`Proxy address copied: ${address}`);
+    } catch {
+      setConnectionSetupError(true);
+      setConnectionSetupMessage(
+        "Copy failed. Select the proxy address and copy it manually.",
+      );
+    }
+  };
+
+  const testProxyConnection = async () => {
+    setConnectionCheckBusy(true);
+    setConnectionCheck(null);
+    setConnectionSetupMessage("");
+    setConnectionSetupError(false);
+    try {
+      const result = await invoke<ConnectionCheckResult>(
+        "test_proxy_connection",
+        {
+          clientProfileId: proxyCredential?.profileId ?? null,
+          clientToken: proxyCredential?.token ?? null,
+        },
+      );
+      setConnectionCheck(result);
+      setConnectionSetupError(false);
+      setConnectionSetupMessage(
+        `Local request completed through ${result.proxyAddress} with HTTP ${result.httpStatus}.`,
+      );
+    } catch (cause) {
+      setConnectionSetupError(true);
+      setConnectionSetupMessage(String(cause));
+    } finally {
+      setConnectionCheckBusy(false);
+    }
+  };
+
+  const finishConnectionSetup = () => {
+    if (!connectionCheck) return;
+    try {
+      localStorage.setItem(connectionSetupKey, "complete");
+    } catch {
+      // Finishing still hides the guide for this run when storage is unavailable.
+    }
+    setShowConnectionSetup(false);
+  };
+
+  const openConnectionSetup = () => {
+    setConnectionCheck(null);
+    setConnectionSetupMessage("");
+    setConnectionSetupError(false);
+    setShowConnectionSetup(true);
+    setSection("Traffic");
   };
 
   useEffect(() => {
@@ -775,6 +856,138 @@ function App() {
         )}
         {section === "Traffic" ? (
           <>
+            {showConnectionSetup && (
+              <section
+                className="connection-setup"
+                aria-labelledby="setup-title"
+              >
+                <div className="connection-setup-heading">
+                  <div>
+                    <span className="eyebrow">FIRST CONNECTION</span>
+                    <h2 id="setup-title">
+                      Connect an application in three steps.
+                    </h2>
+                  </div>
+                  <button onClick={() => setShowConnectionSetup(false)}>
+                    Hide for now
+                  </button>
+                </div>
+                <ol className="connection-steps">
+                  <li className={running ? "complete" : ""}>
+                    <span className="step-number">1</span>
+                    <div>
+                      <strong>Start the local proxy</strong>
+                      <p>
+                        It listens only on this device. Sippin Soda never
+                        changes the Windows or browser proxy automatically.
+                      </p>
+                      {!running && (
+                        <button
+                          className="primary"
+                          disabled={
+                            !desktop ||
+                            !status ||
+                            busy ||
+                            !validPort ||
+                            !validBudget ||
+                            !validRedactionPaths ||
+                            !validHostRules ||
+                            !validResponseRules ||
+                            (requireClientAuth && !selectedClient) ||
+                            (enableHttpsInspection &&
+                              !canRequestHttpsInspection)
+                          }
+                          onClick={() => void proxyCommand()}
+                        >
+                          {busy ? "Starting…" : "Start proxy"}
+                        </button>
+                      )}
+                    </div>
+                  </li>
+                  <li className={running ? "active" : ""}>
+                    <span className="step-number">2</span>
+                    <div>
+                      <strong>Configure your browser or application</strong>
+                      <p>
+                        Use HTTP proxy <code>127.0.0.1</code> on port{" "}
+                        <code>
+                          {running
+                            ? status?.listenAddress.split(":").at(-1)
+                            : port}
+                        </code>
+                        . Use the same HTTP proxy for HTTPS traffic; HTTPS
+                        clients create a CONNECT tunnel through it.
+                      </p>
+                      <code className="setup-address">
+                        {status?.listenAddress ?? `127.0.0.1:${port}`}
+                      </code>
+                      <button onClick={() => void copyProxyAddress()}>
+                        Copy proxy address
+                      </button>
+                      {running && proxyCredential && (
+                        <p className="setup-secret-note">
+                          This run requires the profile ID and ephemeral
+                          password shown in Proxy options below. Treat that
+                          password as a local secret.
+                        </p>
+                      )}
+                    </div>
+                  </li>
+                  <li className={connectionCheck ? "complete" : ""}>
+                    <span className="step-number">3</span>
+                    <div>
+                      <strong>Verify the proxy path</strong>
+                      <p>
+                        Run an end-to-end request through the proxy and a
+                        temporary loopback origin. No Internet connection is
+                        used.
+                      </p>
+                      <button
+                        disabled={
+                          !desktop ||
+                          !running ||
+                          connectionCheckBusy ||
+                          (Boolean(status?.clientProfileId) && !proxyCredential)
+                        }
+                        onClick={() => void testProxyConnection()}
+                      >
+                        {connectionCheckBusy
+                          ? "Checking…"
+                          : connectionCheck
+                            ? "Run check again"
+                            : "Test local connection"}
+                      </button>
+                    </div>
+                  </li>
+                </ol>
+                {connectionSetupMessage && (
+                  <p
+                    className={
+                      connectionSetupError
+                        ? "setup-error"
+                        : connectionCheck
+                          ? "setup-success"
+                          : "setup-message"
+                    }
+                    role="status"
+                  >
+                    {connectionSetupMessage}
+                  </p>
+                )}
+                <div className="connection-setup-actions">
+                  <button
+                    className="primary"
+                    disabled={!connectionCheck}
+                    onClick={finishConnectionSetup}
+                  >
+                    Finish setup
+                  </button>
+                  <span>
+                    You can reopen this guide from Settings at any time.
+                  </span>
+                </div>
+              </section>
+            )}
             <div className="body-options">
               <label>
                 <input
@@ -1273,6 +1486,7 @@ function App() {
                   : "Read-only by design"}
               </dd>
             </dl>
+            <button onClick={openConnectionSetup}>Open connection setup</button>{" "}
             <button disabled={running || busy} onClick={resetWorkspaceSettings}>
               Reset saved proxy settings
             </button>

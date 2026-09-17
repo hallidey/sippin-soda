@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a first-connection guide with explicit proxy setup instructions, persistent completion state and an authenticated end-to-end loopback diagnostic.
 - Add an unsigned, per-user Windows NSIS installer with Italian/English localization and a manual artifact workflow.
 - Persist validated non-secret proxy workspace settings locally across app restarts, with an explicit reset action; ephemeral credentials and HTTPS inspection opt-in remain per-run.
 - Add ordered Development-only response rules for host/path/method matching, bounded status/body replacement and visible applied-rule metadata.

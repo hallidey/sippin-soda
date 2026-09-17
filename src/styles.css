@@ -458,6 +458,101 @@ dd {
   margin: 0 32px 20px;
   color: #f4a49a;
 }
+.connection-setup {
+  margin: 0 32px 20px;
+  padding: 22px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.connection-setup-heading,
+.connection-setup-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+.connection-setup-heading h2 {
+  margin: 7px 0 0;
+  font-size: 18px;
+}
+.connection-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin: 22px 0;
+  padding: 0;
+  list-style: none;
+}
+.connection-steps li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-content: start;
+  gap: 10px;
+  min-height: 190px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.connection-steps li.complete {
+  border-color: var(--accent);
+}
+.connection-steps li.active .step-number,
+.connection-steps li.complete .step-number {
+  color: var(--bg);
+  background: var(--accent);
+}
+.step-number {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.connection-steps strong {
+  font-size: 12px;
+}
+.connection-steps p,
+.connection-setup-actions span,
+.setup-message,
+.setup-success,
+.setup-error {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.connection-steps p {
+  min-height: 50px;
+  margin: 8px 0 12px;
+}
+.setup-address {
+  display: block;
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.connection-steps .setup-secret-note {
+  min-height: 0;
+  color: #e7c477;
+}
+.setup-message,
+.setup-success,
+.setup-error {
+  margin: 0 0 16px;
+}
+.setup-success {
+  color: var(--accent);
+}
+.setup-error {
+  color: #f4a49a;
+}
+.connection-setup-actions {
+  justify-content: flex-start;
+}
 :root[data-theme="light"] {
   --bg: #f7f8f4;
   --side: #eff1eb;
@@ -790,6 +885,15 @@ input:focus-visible {
   min-height: 230px;
 }
 @media (max-width: 1100px) {
+  .connection-steps {
+    grid-template-columns: 1fr;
+  }
+  .connection-steps li {
+    min-height: 0;
+  }
+  .connection-steps p {
+    min-height: 0;
+  }
   .rule-fields {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

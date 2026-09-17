@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use sippin_soda_engine::{
-    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus,
+    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, EnginePhase, JsonStatus,
     ProxyClientAuth, ProxyConfig, ProxyEngine, ProxyTlsInterception, ResponseRuleConfig,
     SearchStep, Snapshot, TlsClientIdentity, TlsInspectionPreflight, TlsTrustCheckManager,
     TlsTrustCheckStatus,
@@ -10,6 +10,13 @@ use sippin_soda_engine::{
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
+
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +40,154 @@ struct StartProxyOptions {
     break_on_responses: bool,
     #[serde(default)]
     response_rules: Vec<ResponseRuleConfig>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionCheckResult {
+    proxy_address: String,
+    http_status: u16,
+}
+
+async fn read_http_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut head = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|_| "The local connection check could not read HTTP data.".to_string())?;
+        if read == 0 {
+            return Err("The local connection check ended before HTTP headers arrived.".into());
+        }
+        head.extend_from_slice(&buffer[..read]);
+        if head.len() > 16 * 1024 {
+            return Err("The local connection check received oversized HTTP headers.".into());
+        }
+    }
+    Ok(head)
+}
+
+fn response_status(head: &[u8]) -> Result<u16, String> {
+    let first_line = head
+        .split(|byte| *byte == b'\n')
+        .next()
+        .ok_or("The proxy returned an invalid HTTP response.")?;
+    let first_line = std::str::from_utf8(first_line)
+        .map_err(|_| "The proxy returned a non-UTF-8 HTTP status line.")?;
+    first_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| "The proxy returned an invalid HTTP status line.".into())
+}
+
+async fn run_proxy_connection_check(
+    engine: &ProxyEngine,
+    client_profile_id: Option<String>,
+    client_token: Option<String>,
+) -> Result<ConnectionCheckResult, String> {
+    let snapshot = engine.snapshot();
+    if snapshot.status.phase != EnginePhase::Running {
+        return Err("Start the proxy before running the connection check.".into());
+    }
+    match (
+        snapshot.status.client_profile_id.as_deref(),
+        client_profile_id.as_deref(),
+        client_token.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(expected), Some(profile), Some(token))
+            if expected == profile && !token.is_empty() => {}
+        (Some(_), _, _) => {
+            return Err(
+                "The current proxy authentication password is unavailable. Restart the proxy and try again."
+                    .into(),
+            )
+        }
+        (None, _, _) => {
+            return Err("This proxy run does not use client authentication.".into())
+        }
+    }
+
+    let origin = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|_| "The connection check could not reserve a local test endpoint.")?;
+    let origin_address = origin
+        .local_addr()
+        .map_err(|_| "The connection check could not read its local endpoint.")?;
+    let origin_task = tauri::async_runtime::spawn(async move {
+        let (mut connection, _) = timeout(Duration::from_secs(20), origin.accept())
+            .await
+            .map_err(|_| "The proxy did not reach the local test endpoint in time.".to_string())?
+            .map_err(|_| {
+                "The local test endpoint could not accept the proxy connection.".to_string()
+            })?;
+        let request = read_http_head(&mut connection).await?;
+        let expected = b"GET /__sippin_connection_check HTTP/1.1";
+        if !request.starts_with(expected) {
+            return Err("The local test endpoint received an unexpected request.".into());
+        }
+        connection
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nX-Sippin-Soda-Diagnostic: ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .map_err(|_| "The local test endpoint could not return its response.".to_string())?;
+        Ok::<(), String>(())
+    });
+
+    let proxy_address = snapshot.status.listen_address;
+    let check = timeout(Duration::from_secs(20), async {
+        let mut connection = TcpStream::connect(proxy_address)
+            .await
+            .map_err(|_| "The desktop process could not connect to the running proxy.".to_string())?;
+        let authorization = match (client_profile_id, client_token) {
+            (Some(profile), Some(token)) => format!(
+                "Proxy-Authorization: Basic {}\r\n",
+                BASE64_STANDARD.encode(format!("{profile}:{token}"))
+            ),
+            _ => String::new(),
+        };
+        let request = format!(
+            "GET http://{origin_address}/__sippin_connection_check HTTP/1.1\r\nHost: {origin_address}\r\n{authorization}Connection: close\r\n\r\n"
+        );
+        connection
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|_| "The desktop process could not send the proxy test request.".to_string())?;
+        let response = read_http_head(&mut connection).await?;
+        response_status(&response)
+    })
+    .await
+    .map_err(|_| "The proxy connection check timed out.".to_string())?;
+
+    let http_status = match check {
+        Ok(status) => status,
+        Err(error) => {
+            origin_task.abort();
+            return Err(error);
+        }
+    };
+    origin_task
+        .await
+        .map_err(|_| "The local test endpoint stopped unexpectedly.".to_string())??;
+    if http_status == 407 {
+        return Err("The proxy rejected the temporary client credentials.".into());
+    }
+    Ok(ConnectionCheckResult {
+        proxy_address: proxy_address.to_string(),
+        http_status,
+    })
+}
+
+#[tauri::command]
+async fn test_proxy_connection(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    client_profile_id: Option<String>,
+    client_token: Option<String>,
+) -> Result<ConnectionCheckResult, String> {
+    run_proxy_connection_check(engine.inner(), client_profile_id, client_token).await
 }
 
 #[tauri::command]
@@ -388,6 +543,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             engine_snapshot,
             start_proxy,
+            test_proxy_connection,
             stop_proxy,
             clear_traffic,
             replay_capture,
@@ -422,4 +578,81 @@ fn main() {
                 engine.clear();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn available_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[tokio::test]
+    async fn connection_check_traverses_the_running_proxy() {
+        let engine = ProxyEngine::default();
+        let port = available_port();
+        engine
+            .start(ProxyConfig {
+                port,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let result = run_proxy_connection_check(&engine, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.proxy_address, format!("127.0.0.1:{port}"));
+        assert_eq!(result.http_status, 204);
+        assert!(engine
+            .snapshot()
+            .traffic
+            .iter()
+            .any(|capture| capture.target.contains("/__sippin_connection_check")));
+        engine.stop().await;
+    }
+
+    #[tokio::test]
+    async fn connection_check_uses_the_ephemeral_client_credential() {
+        let engine = ProxyEngine::default();
+        let port = available_port();
+        let profile = "first-run-client";
+        let token = "temporary-connection-check-token";
+        engine
+            .start(ProxyConfig {
+                port,
+                client_auth: Some(ProxyClientAuth::new(profile, token).unwrap()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let result =
+            run_proxy_connection_check(&engine, Some(profile.to_string()), Some(token.to_string()))
+                .await
+                .unwrap();
+
+        assert_eq!(result.http_status, 204);
+        assert!(engine
+            .snapshot()
+            .traffic
+            .iter()
+            .any(|capture| capture.client_profile_id.as_deref() == Some(profile)));
+        engine.stop().await;
+    }
+
+    #[test]
+    fn connection_check_rejects_invalid_status_lines() {
+        assert_eq!(
+            response_status(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap(),
+            204
+        );
+        assert!(response_status(b"not-http\r\n\r\n").is_err());
+    }
 }

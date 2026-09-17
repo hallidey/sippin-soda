@@ -13,4 +13,5 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 sippin-soda-engine = { path = "../crates/engine" }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["time"] }
+base64 = "0.22"
+tokio = { version = "1", features = ["time", "net", "io-util", "macros", "rt-multi-thread"] }
