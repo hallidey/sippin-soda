@@ -27,6 +27,7 @@ pub struct EngineStatus {
     pub production_protection: bool,
     pub evicted_captures: u64,
     pub rejected_connections: u64,
+    pub client_profile_id: Option<String>,
 }
 
 impl Default for EngineStatus {
@@ -39,6 +40,7 @@ impl Default for EngineStatus {
             production_protection: true,
             evicted_captures: 0,
             rejected_connections: 0,
+            client_profile_id: None,
         }
     }
 }

@@ -1,4 +1,7 @@
-use sippin_soda_engine::{EnginePhase, ProxyConfig, ProxyEngine};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use sippin_soda_engine::{
+    EnginePhase, ProxyClientAuth, ProxyConfig, ProxyEngine, ResponseRuleConfig,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -55,6 +58,406 @@ async fn start() -> (ProxyEngine, u16) {
     (engine, port)
 }
 
+async fn replay_fixture() -> (u16, oneshot::Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sent, received) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            loop {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+        let _ = sent.send(requests);
+    });
+    (port, received)
+}
+
+#[tokio::test]
+async fn replays_bodyless_development_get_to_same_url_without_credentials() {
+    let (upstream, received) = replay_fixture().await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            client_auth: Some(
+                ProxyClientAuth::new("desktop", "replay-secret-0123456789abcdefgh").unwrap(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let port = snapshot.status.listen_address.port();
+    let credential = BASE64.encode("desktop:replay-secret-0123456789abcdefgh");
+    let reply = send(
+        port,
+        format!(
+            "GET http://127.0.0.1:{upstream}/items?token=original HTTP/1.1\r\nHost: wrong.invalid\r\nProxy-Authorization: Basic {credential}\r\nAuthorization: Bearer secret\r\nCookie: session=secret\r\nX-Api-Key: secret\r\nAccept: application/json\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 200"));
+    let origin = engine.snapshot().traffic[0].clone();
+    let snapshot = engine.replay(origin.id).await.unwrap();
+    assert_eq!(snapshot.traffic.len(), 2);
+    assert_eq!(snapshot.traffic[0].replay_of, Some(origin.id));
+    assert_eq!(snapshot.traffic[0].status, Some(200));
+    assert_eq!(
+        snapshot.traffic[0].destination_class,
+        origin.destination_class
+    );
+    assert_eq!(
+        snapshot.traffic[0].client_profile_id.as_deref(),
+        Some("desktop")
+    );
+    let requests = received.await.unwrap();
+    assert!(requests[1].starts_with("GET /items?token=original HTTP/1.1\r\n"));
+    let replay = requests[1].to_ascii_lowercase();
+    assert!(replay.contains("accept: application/json"));
+    assert!(!replay.contains("authorization:"));
+    assert!(!replay.contains("cookie:"));
+    assert!(!replay.contains("x-api-key:"));
+    assert!(!replay.contains("x-sippin-internal-replay"));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn replay_fails_closed_for_production_and_unsupported_requests() {
+    let (upstream, _) = fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            production_hosts: vec!["127.0.0.1".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 204"));
+    let capture = engine.snapshot().traffic[0].clone();
+    assert!(engine.replay(capture.id).await.is_err());
+    engine.stop().await;
+
+    let (upstream, _) = fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let (engine, port) = start().await;
+    let reply = send(
+        port,
+        format!("POST http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 204"));
+    let capture = engine.snapshot().traffic[0].clone();
+    assert!(engine.replay(capture.id).await.is_err());
+    engine.stop().await;
+}
+
+fn response_rule(id: &str, name: &str, host: &str, path: &str, status: u16) -> ResponseRuleConfig {
+    ResponseRuleConfig {
+        id: id.into(),
+        name: name.into(),
+        enabled: true,
+        host: host.into(),
+        path_prefix: path.into(),
+        method: Some("GET".into()),
+        status,
+        body: None,
+        content_type: None,
+    }
+}
+
+#[tokio::test]
+async fn development_response_rule_can_replace_and_record_a_bounded_body() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\nETag: old\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let mut rule = response_rule("mock", "Mock JSON", "127.0.0.1", "/mock", 502);
+    rule.body = Some("{\"mock\":true}".into());
+    rule.content_type = Some("application/json".into());
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            capture_bodies: true,
+            body_disk_budget: 1024 * 1024,
+            response_rules: vec![rule],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/mock HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 502"));
+    assert!(reply
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    assert!(!reply.to_ascii_lowercase().contains("content-encoding"));
+    assert!(!reply.to_ascii_lowercase().contains("etag:"));
+    assert!(reply.ends_with("{\"mock\":true}"));
+    let capture = engine.snapshot().traffic[0].clone();
+    let page = engine.response_body_page(capture.id, 0, 64).await.unwrap();
+    assert_eq!(page.bytes, b"{\"mock\":true}");
+    assert_eq!(capture.response_bytes, 13);
+    assert_eq!(capture.response_rule_id.as_deref(), Some("mock"));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn first_matching_development_response_rule_overrides_status() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            response_rules: vec![
+                response_rule("specific", "Teapot API", "127.0.0.1", "/api/", 418),
+                response_rule("fallback", "Fallback", "127.0.0.1", "/", 503),
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/api/items HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 418"));
+    assert!(reply.ends_with("hello"));
+    let capture = &engine.snapshot().traffic[0];
+    assert_eq!(capture.status, Some(418));
+    assert_eq!(capture.original_status, Some(201));
+    assert_eq!(capture.response_rule_id.as_deref(), Some("specific"));
+    assert_eq!(capture.response_rule_name.as_deref(), Some("Teapot API"));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn response_rules_validate_and_never_modify_production() {
+    let engine = ProxyEngine::default();
+    assert!(engine
+        .start(ProxyConfig {
+            port: 0,
+            response_rules: vec![response_rule("bad", "Bad", "127.0.0.1", "api", 199)],
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    let mut oversized = response_rule("large", "Large", "127.0.0.1", "/", 500);
+    oversized.body = Some("x".repeat(65_537));
+    oversized.content_type = Some("text/plain".into());
+    assert!(engine
+        .start(ProxyConfig {
+            port: 0,
+            response_rules: vec![oversized],
+            ..Default::default()
+        })
+        .await
+        .is_err());
+
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            production_hosts: vec!["127.0.0.1".into()],
+            response_rules: vec![response_rule("blocked", "Blocked", "127.0.0.1", "/", 503)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 201"));
+    let capture = &engine.snapshot().traffic[0];
+    assert_eq!(capture.response_rule_id, None);
+    assert_eq!(capture.original_status, None);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn development_response_breakpoint_can_override_status_once() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let engine = Arc::new(ProxyEngine::default());
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            break_on_responses: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let port = snapshot.status.listen_address.port();
+    let request = tokio::spawn(send(
+        port,
+        format!("GET http://127.0.0.1:{upstream}/break HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    ));
+    let capture = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot
+                .traffic
+                .first()
+                .is_some_and(|capture| capture.breakpoint_state == "waiting")
+            {
+                break snapshot.traffic[0].clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(capture.original_status, Some(201));
+    assert!(!request.is_finished());
+    engine
+        .resolve_response_breakpoint(capture.id, Some(503), None, None)
+        .unwrap();
+    let reply = request.await.unwrap();
+    assert!(reply.starts_with("HTTP/1.1 503"));
+    assert!(reply.ends_with("hello"));
+    assert!(engine
+        .resolve_response_breakpoint(capture.id, None, None, None)
+        .is_err());
+    assert!(engine
+        .resolve_response_breakpoint(capture.id, Some(199), None, None)
+        .is_err());
+    let snapshot = engine.stop().await;
+    assert_eq!(snapshot.traffic[0].status, Some(503));
+    assert_eq!(snapshot.traffic[0].breakpoint_state, "modified");
+}
+
+#[tokio::test]
+async fn development_response_breakpoint_can_replace_a_bounded_body() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\nETag: old\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let engine = Arc::new(ProxyEngine::default());
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            break_on_responses: true,
+            capture_bodies: true,
+            body_disk_budget: 1024 * 1024,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let request = tokio::spawn(send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/mock HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    ));
+    let capture = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot
+                .traffic
+                .first()
+                .is_some_and(|capture| capture.breakpoint_state == "waiting")
+            {
+                break snapshot.traffic[0].clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    engine
+        .resolve_response_breakpoint(
+            capture.id,
+            Some(202),
+            Some("{\"mock\":true}".into()),
+            Some("application/json".into()),
+        )
+        .unwrap();
+    let reply = request.await.unwrap();
+    assert!(reply.starts_with("HTTP/1.1 202"));
+    assert!(reply
+        .to_lowercase()
+        .contains("content-type: application/json"));
+    assert!(reply.to_lowercase().contains("content-length: 13"));
+    assert!(!reply.to_lowercase().contains("content-encoding"));
+    assert!(!reply.to_lowercase().contains("etag:"));
+    assert!(reply.ends_with("{\"mock\":true}"));
+    let page = engine.response_body_page(capture.id, 0, 64).await.unwrap();
+    assert_eq!(page.bytes, b"{\"mock\":true}");
+    assert_eq!(page.state, "complete");
+    assert_eq!(engine.snapshot().traffic[0].response_bytes, 13);
+    assert!(engine
+        .resolve_response_breakpoint(
+            capture.id,
+            Some(200),
+            Some("x".repeat(65_537)),
+            Some("text/plain".into()),
+        )
+        .is_err());
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn response_breakpoints_never_pause_production() {
+    let (upstream, _) = fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            break_on_responses: true,
+            production_hosts: vec!["127.0.0.1".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 204"));
+    let snapshot = engine.stop().await;
+    assert_eq!(snapshot.traffic[0].breakpoint_state, "none");
+    assert_eq!(
+        snapshot.traffic[0].destination_class,
+        sippin_soda_engine::DestinationClass::Production
+    );
+}
+
 #[tokio::test]
 async fn forwards_to_real_upstream_and_captures_only_filtered_metadata() {
     let (upstream, received) = fixture(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nSet-Cookie: private=value\r\nConnection: X-Internal\r\nX-Internal: hop\r\n\r\nhello".to_vec(), Duration::ZERO).await;
@@ -89,6 +492,66 @@ async fn forwards_to_real_upstream_and_captures_only_filtered_metadata() {
         .response_headers
         .iter()
         .any(|(name, value)| name == "set-cookie" && value == "[REDACTED]"));
+}
+
+#[tokio::test]
+async fn optional_proxy_authentication_binds_accepted_requests_to_one_profile() {
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    let (upstream, received) =
+        fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let port = snapshot.status.listen_address.port();
+    assert_eq!(
+        snapshot.status.client_profile_id.as_deref(),
+        Some("browser-1")
+    );
+
+    let missing = send(
+        port,
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(missing.starts_with("HTTP/1.1 407"));
+    assert!(missing.to_ascii_lowercase().contains("proxy-authenticate"));
+    let wrong = BASE64.encode(format!("browser-1:{TOKEN}x"));
+    assert!(
+        send(
+            port,
+            format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic {wrong}\r\n\r\n"),
+        )
+        .await
+        .starts_with("HTTP/1.1 407")
+    );
+    assert!(engine.snapshot().traffic.is_empty());
+
+    let valid = BASE64.encode(format!("browser-1:{TOKEN}"));
+    assert!(
+        send(
+            port,
+            format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic {valid}\r\n\r\n"),
+        )
+        .await
+        .starts_with("HTTP/1.1 204")
+    );
+    let forwarded = received.await.unwrap();
+    assert!(!forwarded
+        .to_ascii_lowercase()
+        .contains("proxy-authorization"));
+    let snapshot = engine.stop().await;
+    assert!(snapshot.status.client_profile_id.is_none());
+    assert_eq!(snapshot.traffic.len(), 1);
+    assert_eq!(
+        snapshot.traffic[0].client_profile_id.as_deref(),
+        Some("browser-1")
+    );
 }
 
 #[tokio::test]

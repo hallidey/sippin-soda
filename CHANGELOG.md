@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Persist validated non-secret proxy workspace settings locally across app restarts, with an explicit reset action; ephemeral credentials and HTTPS inspection opt-in remain per-run.
+- Add ordered Development-only response rules for host/path/method matching, bounded status/body replacement and visible applied-rule metadata.
+- Add safe same-target replay for completed bodyless Development HTTP GET/HEAD captures without built-in credential headers.
+- Add Development response breakpoints with timeout, final-status override and bounded UTF-8 body replacement.
+- Add opt-in verified Development HTTPS inspection for persistent HTTP/1.1 and bounded multiplexed HTTP/2 exchanges.
+
 - Add full-body literal UTF-8 search with progress, cancellation, overlapping matches and navigation to the matching raw offset.
 - Add validated, paged JSON layout on disk, preserving number precision, duplicate keys and escapes; preparation is cancellable and shares the body storage budget.
 - Add opt-in HTTP response recording to temporary disk files, with 64 KiB text/hex pages, direct byte offsets and streaming gzip/deflate/Brotli decoding.
@@ -19,4 +25,4 @@
 - Add navigation, theme preferences and an explicit empty traffic state.
 - Configure native CI checks for Windows, macOS and Linux.
 
-This is a desktop development preview. Request body inspection, body redaction, replay, TLS interception and installers are not available yet.
+This remains a desktop development preview. Installer packaging, portable sessions, edit/session replay and advanced rule actions are not available yet.

@@ -1,4 +1,12 @@
-use crate::{DestinationClass, EnginePhase, EngineStatus};
+use crate::{
+    authorize, establish_verified_tls_with_config, platform_tls_client_config, Action, CaManager,
+    DestinationClass, EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInterceptError,
+    TlsTrustCheckManager, HTTP2_ALPN, INSPECTION_ALPN,
+};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 mod bodies;
 mod tunnel;
 pub use bodies::{BodyPage, JsonStatus, SearchStep};
@@ -7,30 +15,59 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Body, Bytes, Frame, Incoming, SizeHint},
     header::{HeaderMap, HeaderValue, HOST},
+    http::uri::Authority,
     server::conn::http1,
     service::service_fn,
     Method, Request, Response, StatusCode,
 };
+use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
+    fmt,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
+use tokio_rustls::rustls::ClientConfig;
 use tunnel::Tunnel;
 
 type WireBody = BoxBody<Bytes, hyper::Error>;
+const INTERNAL_REPLAY_HEADER: &str = "x-sippin-internal-replay";
+
+enum UpstreamSender {
+    Http1(hyper::client::conn::http1::SendRequest<RequestBody>),
+    Http2(hyper::client::conn::http2::SendRequest<RequestBody>),
+}
+
+impl UpstreamSender {
+    fn is_http2(&self) -> bool {
+        matches!(self, Self::Http2(_))
+    }
+
+    async fn send_request(
+        &mut self,
+        request: Request<RequestBody>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
+        match self {
+            Self::Http1(sender) => sender.send_request(request).await,
+            Self::Http2(sender) => sender.send_request(request).await,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -44,6 +81,166 @@ pub struct ProxyConfig {
     pub request_redaction_paths: Vec<String>,
     pub development_hosts: Vec<String>,
     pub production_hosts: Vec<String>,
+    pub client_auth: Option<ProxyClientAuth>,
+    pub tls_interception: Option<ProxyTlsInterception>,
+    pub break_on_responses: bool,
+    pub response_rules: Vec<ResponseRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseRuleConfig {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub host: String,
+    pub path_prefix: String,
+    pub method: Option<String>,
+    pub status: u16,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+type LeafIssuer =
+    dyn Fn(&str, DestinationClass) -> Result<Option<IssuedLeaf>, String> + Send + Sync;
+
+#[derive(Clone)]
+pub struct ProxyTlsInterception {
+    profile_id: String,
+    upstream_config: Arc<ClientConfig>,
+    issue_leaf: Arc<LeafIssuer>,
+}
+
+impl fmt::Debug for ProxyTlsInterception {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProxyTlsInterception")
+            .field("profile_id", &self.profile_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxyTlsInterception {
+    pub fn platform(
+        ca: Arc<CaManager>,
+        trust: Arc<TlsTrustCheckManager>,
+        profile_id: &str,
+    ) -> Result<Self, String> {
+        let profile_id = TlsClientIdentity::validate_id(profile_id)?;
+        let proof_profile_id = profile_id.clone();
+        let issue_leaf = Arc::new(move |host: &str, destination: DestinationClass| {
+            if destination != DestinationClass::Development {
+                return Ok(None);
+            }
+            let status = ca.status()?;
+            let ready = trust
+                .readiness(&status, &proof_profile_id)
+                .is_some_and(|readiness| readiness.can_inspect_development);
+            if !ready {
+                return Ok(None);
+            }
+            let leaf = ca.issue_leaf(host, destination)?;
+            if Some(&leaf.issuer_fingerprint_sha256) != status.fingerprint_sha256.as_ref() {
+                return Err("The local CA changed while preparing TLS interception.".into());
+            }
+            Ok(Some(leaf))
+        });
+        Ok(Self {
+            profile_id,
+            upstream_config: platform_tls_client_config()?,
+            issue_leaf,
+        })
+    }
+
+    fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    async fn prepare(
+        &self,
+        host: &str,
+        destination: DestinationClass,
+        client_profile_id: Option<&str>,
+    ) -> Result<Option<TlsInterceptRoute>, String> {
+        if destination != DestinationClass::Development
+            || client_profile_id != Some(self.profile_id())
+        {
+            return Ok(None);
+        }
+        let issue_leaf = self.issue_leaf.clone();
+        let host = host.to_owned();
+        let worker_host = host.clone();
+        let leaf = tokio::task::spawn_blocking(move || issue_leaf(&worker_host, destination))
+            .await
+            .map_err(|_| "TLS certificate worker failed.".to_string())??;
+        Ok(leaf.map(|leaf| TlsInterceptRoute {
+            host,
+            leaf,
+            upstream_config: self.upstream_config.clone(),
+        }))
+    }
+}
+
+struct TlsInterceptRoute {
+    host: String,
+    leaf: IssuedLeaf,
+    upstream_config: Arc<ClientConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyClientAuth {
+    profile_id: String,
+    token_sha256: [u8; 32],
+}
+
+impl ProxyClientAuth {
+    pub fn new(profile_id: &str, token: &str) -> Result<Self, String> {
+        let profile_id = TlsClientIdentity::validate_id(profile_id)?;
+        if !(32..=128).contains(&token.len())
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("Proxy client tokens must use 32-128 letters, numbers, '-' or '_'.".into());
+        }
+        Ok(Self {
+            profile_id,
+            token_sha256: Sha256::digest(token.as_bytes()).into(),
+        })
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    fn accepts(&self, headers: &HeaderMap) -> bool {
+        let Some(value) = headers
+            .get("proxy-authorization")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+        let Some(encoded) = value
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+            .map(|(_, encoded)| encoded.trim())
+        else {
+            return false;
+        };
+        let Ok(decoded) = BASE64.decode(encoded) else {
+            return false;
+        };
+        let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let (profile_id, token) = decoded.split_at(separator);
+        let token = &token[1..];
+        let presented_token_sha256: [u8; 32] = Sha256::digest(token).into();
+        profile_id == self.profile_id.as_bytes()
+            && bool::from(presented_token_sha256.ct_eq(&self.token_sha256))
+    }
 }
 
 impl Default for ProxyConfig {
@@ -59,6 +256,10 @@ impl Default for ProxyConfig {
             request_redaction_paths: vec![],
             development_hosts: vec![],
             production_hosts: vec![],
+            client_auth: None,
+            tls_interception: None,
+            break_on_responses: false,
+            response_rules: vec![],
         }
     }
 }
@@ -71,6 +272,7 @@ pub struct Capture {
     pub method: String,
     pub target: String,
     pub destination_class: DestinationClass,
+    pub client_profile_id: Option<String>,
     pub started_at: u64,
     pub status: Option<u16>,
     pub phase: String,
@@ -83,6 +285,11 @@ pub struct Capture {
     pub request_body_state: String,
     pub request_body_error: Option<String>,
     pub response_body_error: Option<String>,
+    pub breakpoint_state: String,
+    pub original_status: Option<u16>,
+    pub replay_of: Option<u64>,
+    pub response_rule_id: Option<String>,
+    pub response_rule_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +458,152 @@ struct State {
     body_budget: u64,
     request_redaction_paths: Vec<Vec<String>>,
     destination_classifier: DestinationClassifier,
+    break_on_responses: bool,
+    response_rules: Vec<ResponseRule>,
+    breakpoints: HashMap<u64, oneshot::Sender<BreakpointDecision>>,
+    replay_templates: HashMap<u64, ReplayTemplate>,
+    replay_tokens: HashMap<String, ReplayAuthorization>,
+}
+
+#[derive(Clone)]
+struct ResponseRule {
+    id: String,
+    name: String,
+    host: HostPattern,
+    path_prefix: String,
+    method: Option<Method>,
+    status: StatusCode,
+    body: Option<Bytes>,
+    content_type: Option<HeaderValue>,
+}
+
+impl ResponseRule {
+    fn compile_all(configs: &[ResponseRuleConfig]) -> Result<Vec<Self>, String> {
+        if configs.len() > 64 {
+            return Err("At most 64 response rules are allowed.".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        configs
+            .iter()
+            .filter(|config| config.enabled)
+            .map(|config| -> Result<Self, String> {
+                if config.id.is_empty()
+                    || config.id.len() > 128
+                    || !config.id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                    || !ids.insert(config.id.clone())
+                {
+                    return Err("Response rule IDs must be unique safe identifiers up to 128 characters.".into());
+                }
+                let name = config.name.trim();
+                if name.is_empty() || name.len() > 80 {
+                    return Err("Response rule names must use 1-80 bytes.".into());
+                }
+                if !config.path_prefix.starts_with('/') || config.path_prefix.len() > 1024 {
+                    return Err("Response rule path prefixes must begin with '/' and use at most 1024 bytes.".into());
+                }
+                let method = config
+                    .method
+                    .as_deref()
+                    .map(|method| {
+                        if method.is_empty()
+                            || method.len() > 16
+                            || !method.bytes().all(|byte| byte.is_ascii_uppercase())
+                        {
+                            return Err("Response rule methods must be uppercase ASCII tokens.");
+                        }
+                        Method::from_bytes(method.as_bytes())
+                            .map_err(|_| "Response rule method is invalid.")
+                    })
+                    .transpose()?;
+                let status = StatusCode::from_u16(config.status)
+                    .ok()
+                    .filter(|status| {
+                        status.is_success()
+                            || status.is_redirection()
+                            || status.is_client_error()
+                            || status.is_server_error()
+                    })
+                    .ok_or("Response rule status must be between 200 and 599.")?;
+                if matches!(status.as_u16(), 204 | 205 | 304) {
+                    return Err(
+                        "Response rules cannot use body-forbidden status 204, 205 or 304.".into(),
+                    );
+                }
+                let replacement = compile_replacement_body(
+                    config.body.as_deref(),
+                    config.content_type.as_deref(),
+                )?;
+                let (body, content_type) = replacement.unzip();
+                Ok(Self {
+                    id: config.id.clone(),
+                    name: name.into(),
+                    host: HostPattern::compile(&config.host)?,
+                    path_prefix: config.path_prefix.clone(),
+                    method,
+                    status,
+                    body,
+                    content_type,
+                })
+            })
+            .collect()
+    }
+
+    fn matches(&self, host: &str, path: &str, method: &Method) -> bool {
+        self.host.matches(&host.to_ascii_lowercase())
+            && path.starts_with(&self.path_prefix)
+            && self
+                .method
+                .as_ref()
+                .is_none_or(|expected| expected == method)
+    }
+}
+
+#[derive(Clone)]
+struct ReplayTemplate {
+    method: Method,
+    uri: hyper::Uri,
+    headers: HeaderMap,
+}
+
+struct ReplayAuthorization {
+    origin_id: u64,
+    client_profile_id: Option<String>,
+}
+
+struct BreakpointDecision {
+    status: Option<StatusCode>,
+    body: Option<Bytes>,
+    content_type: Option<HeaderValue>,
+}
+
+fn compile_replacement_body(
+    body: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<Option<(Bytes, HeaderValue)>, String> {
+    let Some(body) = body else {
+        if content_type.is_some() {
+            return Err("Content-Type can be replaced only with a replacement body.".into());
+        }
+        return Ok(None);
+    };
+    if body.len() > 64 * 1024 {
+        return Err("Replacement body must be at most 65536 UTF-8 bytes.".into());
+    }
+    let content_type = content_type.unwrap_or("text/plain; charset=utf-8");
+    if content_type.trim().is_empty()
+        || content_type.len() > 128
+        || content_type.contains(['\r', '\n'])
+    {
+        return Err("Replacement Content-Type is invalid or longer than 128 bytes.".into());
+    }
+    let content_type = HeaderValue::from_str(content_type.trim())
+        .map_err(|_| "Replacement Content-Type is invalid or longer than 128 bytes.")?;
+    Ok(Some((
+        Bytes::copy_from_slice(body.as_bytes()),
+        content_type,
+    )))
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -283,6 +636,11 @@ impl Default for ProxyEngine {
                 body_budget: 0,
                 request_redaction_paths: vec![],
                 destination_classifier: DestinationClassifier::default(),
+                break_on_responses: false,
+                response_rules: vec![],
+                breakpoints: HashMap::new(),
+                replay_templates: HashMap::new(),
+                replay_tokens: HashMap::new(),
             })),
             running: tokio::sync::Mutex::new(None),
         }
@@ -290,6 +648,94 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub async fn replay(&self, id: u64) -> Result<Snapshot, String> {
+        let (template, address, client_profile_id) = {
+            let state = self.shared.lock().unwrap();
+            if state.status.phase != EnginePhase::Running {
+                return Err("Start the proxy before replaying a request.".into());
+            }
+            let capture = state
+                .traffic
+                .iter()
+                .find(|capture| capture.id == id)
+                .ok_or("Capture cleared or evicted.")?;
+            authorize(capture.destination_class, Action::Replay)
+                .map_err(|_| "Replay is allowed only for Development destinations.")?;
+            if capture.phase != "complete" {
+                return Err("Only a completed request can be replayed.".into());
+            }
+            let template = state
+                .replay_templates
+                .get(&id)
+                .cloned()
+                .ok_or("This capture cannot be replayed; only bodyless HTTP GET and HEAD requests are currently supported.")?;
+            let current_class = state
+                .destination_classifier
+                .classify(template.uri.host().unwrap_or(""));
+            authorize(current_class, Action::Replay).map_err(|_| {
+                "The current destination rules no longer allow replay for this target."
+            })?;
+            (
+                template,
+                state.status.listen_address,
+                capture.client_profile_id.clone(),
+            )
+        };
+        let mut random = [0_u8; 24];
+        getrandom::fill(&mut random)
+            .map_err(|_| "Cannot authorize the internal replay request.")?;
+        let token = URL_SAFE_NO_PAD.encode(random);
+        self.shared.lock().unwrap().replay_tokens.insert(
+            token.clone(),
+            ReplayAuthorization {
+                origin_id: id,
+                client_profile_id,
+            },
+        );
+        let result = replay_through_proxy(address, &token, &template).await;
+        self.shared.lock().unwrap().replay_tokens.remove(&token);
+        result?;
+        Ok(self.snapshot())
+    }
+
+    pub fn resolve_response_breakpoint(
+        &self,
+        id: u64,
+        status: Option<u16>,
+        body: Option<String>,
+        content_type: Option<String>,
+    ) -> Result<Snapshot, String> {
+        let status = status
+            .map(|value| {
+                StatusCode::from_u16(value)
+                    .ok()
+                    .filter(|status| {
+                        status.is_success()
+                            || status.is_redirection()
+                            || status.is_client_error()
+                            || status.is_server_error()
+                    })
+                    .ok_or("Replacement status must be between 200 and 599.")
+            })
+            .transpose()?;
+        let replacement = compile_replacement_body(body.as_deref(), content_type.as_deref())?;
+        let (body, content_type) = replacement.unzip();
+        let sender = self
+            .shared
+            .lock()
+            .unwrap()
+            .breakpoints
+            .remove(&id)
+            .ok_or("Response breakpoint is no longer waiting.")?;
+        sender
+            .send(BreakpointDecision {
+                status,
+                body,
+                content_type,
+            })
+            .map_err(|_| "Response breakpoint closed.".to_string())?;
+        Ok(self.snapshot())
+    }
     pub fn body_export_preview(
         &self,
         id: u64,
@@ -485,10 +931,20 @@ impl ProxyEngine {
         {
             return Err("Invalid proxy resource limits.".into());
         }
+        if let Some(tls) = &config.tls_interception {
+            if config.client_auth.as_ref().map(ProxyClientAuth::profile_id)
+                != Some(tls.profile_id())
+            {
+                return Err(
+                    "HTTPS inspection requires authentication for the same client profile.".into(),
+                );
+            }
+        }
         let request_redaction_paths =
             bodies::compile_redaction_paths(&config.request_redaction_paths)?;
         let destination_classifier =
             DestinationClassifier::compile(&config.development_hosts, &config.production_hosts)?;
+        let response_rules = ResponseRule::compile_all(&config.response_rules)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))
             .await
             .map_err(|e| format!("Cannot listen on 127.0.0.1:{}: {e}", config.port))?;
@@ -500,8 +956,12 @@ impl ProxyEngine {
             state.body_budget = config.body_disk_budget;
             state.request_redaction_paths = request_redaction_paths;
             state.destination_classifier = destination_classifier;
+            state.break_on_responses = config.break_on_responses;
+            state.response_rules = response_rules;
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
+                    state.breakpoints.remove(&capture.id);
+                    state.replay_templates.remove(&capture.id);
                     state.request_bodies.remove(capture.id);
                     state.response_bodies.remove(capture.id);
                 }
@@ -510,6 +970,11 @@ impl ProxyEngine {
             state.status.captures = state.traffic.len();
             state.status.phase = EnginePhase::Running;
             state.status.listen_address = address;
+            state.status.client_profile_id = config
+                .client_auth
+                .as_ref()
+                .map(|auth| auth.profile_id().to_owned());
+            state.status.https_inspection = config.tls_interception.is_some();
             state.revision += 1;
         }
         let (shutdown, mut stop) = oneshot::channel();
@@ -531,12 +996,14 @@ impl ProxyEngine {
                             continue;
                         }
                         let shared = shared.clone();
+                        let client_auth = config.client_auth.clone();
+                        let tls_interception = config.tls_interception.clone();
                         let deadline = config.request_timeout;
                         let tunnel_deadline = config.tunnel_timeout;
                         connections.spawn(async move {
                             let (tunnel_tx, mut tunnel_rx) = oneshot::channel::<Tunnel>();
                             let tunnel_slot = Arc::new(Mutex::new(Some(tunnel_tx)));
-                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone()));
+                            let service = service_fn(move |request| handle(request, shared.clone(), address, deadline, tunnel_slot.clone(), client_auth.clone(), tls_interception.clone()));
                             // The same tracked task owns HTTP negotiation AND the tunnel,
                             // so upgrades cannot escape the connection cap or Stop.
                             let mut builder = http1::Builder::new();
@@ -554,6 +1021,8 @@ impl ProxyEngine {
             drop(listener);
             let mut state = shared.lock().unwrap();
             state.status.phase = EnginePhase::Stopped;
+            state.status.client_profile_id = None;
+            state.status.https_inspection = false;
             state.revision += 1;
         });
         *running = Some(Running { shutdown, task });
@@ -571,6 +1040,9 @@ impl ProxyEngine {
 
     pub fn clear(&self) -> Snapshot {
         let mut state = self.shared.lock().unwrap();
+        state.breakpoints.clear();
+        state.replay_templates.clear();
+        state.replay_tokens.clear();
         state.traffic.clear();
         state.request_bodies.clear();
         state.response_bodies.clear();
@@ -858,68 +1330,69 @@ fn response(status: StatusCode, message: &'static str) -> Response<WireBody> {
     response
 }
 
+fn proxy_authentication_required() -> Response<WireBody> {
+    let mut result = response(
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        "Valid proxy client credentials are required.",
+    );
+    result.headers_mut().insert(
+        "proxy-authenticate",
+        HeaderValue::from_static("Basic realm=\"Sippin Soda\", charset=\"UTF-8\""),
+    );
+    result
+}
+
 async fn handle(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     shared: Shared,
     proxy: SocketAddr,
     deadline: Duration,
     tunnel_slot: Arc<Mutex<Option<oneshot::Sender<Tunnel>>>>,
+    client_auth: Option<ProxyClientAuth>,
+    tls_interception: Option<ProxyTlsInterception>,
 ) -> Result<Response<WireBody>, Infallible> {
+    let replay = request
+        .headers_mut()
+        .remove(INTERNAL_REPLAY_HEADER)
+        .and_then(|value| value.to_str().ok().map(str::to_owned))
+        .and_then(|token| shared.lock().unwrap().replay_tokens.remove(&token));
+    let client_profile_id = match (&replay, client_auth) {
+        (Some(replay), _) => replay.client_profile_id.clone(),
+        (None, Some(auth)) if auth.accepts(request.headers()) => Some(auth.profile_id().to_owned()),
+        (None, Some(_)) => return Ok(proxy_authentication_required()),
+        (None, None) => None,
+    };
     let destination_class = {
         let state = shared.lock().unwrap();
         state
             .destination_classifier
             .classify(request.uri().host().unwrap_or(""))
     };
-    let exchange = {
-        let mut state = shared.lock().unwrap();
-        let id = state.next_id;
-        state.next_id += 1;
-        if state.traffic.len() == state.limit {
-            if let Some(capture) = state.traffic.pop_front() {
-                state.request_bodies.remove(capture.id);
-                state.response_bodies.remove(capture.id);
-            }
-            state.status.evicted_captures += 1;
-        }
-        state.traffic.push_back(Capture {
-            id,
-            kind: if request.method() == Method::CONNECT {
-                "tunnel"
-            } else {
-                "http"
-            }
-            .into(),
-            method: request.method().to_string(),
-            target: safe_target(&request),
-            destination_class,
-            started_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            status: None,
-            phase: "pending".into(),
-            duration_ms: 0,
-            request_bytes: 0,
-            response_bytes: 0,
-            request_headers: safe_headers(request.headers()),
-            response_headers: vec![],
-            error: None,
-            request_body_state: "disabled".into(),
-            request_body_error: None,
-            response_body_error: None,
-        });
-        state.status.captures = state.traffic.len();
-        state.revision += 1;
-        Arc::new(Exchange {
-            shared: shared.clone(),
-            id,
-            started: Instant::now(),
-        })
-    };
+    if replay.is_some() && authorize(destination_class, Action::Replay).is_err() {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            "Replay is allowed only for Development destinations.",
+        ));
+    }
+    let exchange = begin_exchange(
+        shared,
+        &request,
+        destination_class,
+        client_profile_id.clone(),
+        replay.as_ref().map(|replay| replay.origin_id),
+    );
     let operation = async {
         if request.method() == Method::CONNECT {
-            tunnel::establish(request, exchange.clone(), proxy, tunnel_slot).await
+            tunnel::establish(
+                request,
+                exchange.clone(),
+                proxy,
+                tunnel_slot,
+                destination_class,
+                client_profile_id.as_deref(),
+                tls_interception,
+            )
+            .await
         } else {
             forward(request, exchange.clone(), proxy).await
         }
@@ -941,10 +1414,141 @@ async fn handle(
     Ok(result)
 }
 
+fn begin_exchange(
+    shared: Shared,
+    request: &Request<Incoming>,
+    destination_class: DestinationClass,
+    client_profile_id: Option<String>,
+    replay_of: Option<u64>,
+) -> Arc<Exchange> {
+    let replay_template = replay_template(request);
+    let mut state = shared.lock().unwrap();
+    let id = state.next_id;
+    state.next_id += 1;
+    if state.traffic.len() == state.limit {
+        if let Some(capture) = state.traffic.pop_front() {
+            state.breakpoints.remove(&capture.id);
+            state.replay_templates.remove(&capture.id);
+            state.request_bodies.remove(capture.id);
+            state.response_bodies.remove(capture.id);
+        }
+        state.status.evicted_captures += 1;
+    }
+    state.traffic.push_back(Capture {
+        id,
+        kind: if request.method() == Method::CONNECT {
+            "tunnel"
+        } else {
+            "http"
+        }
+        .into(),
+        method: request.method().to_string(),
+        target: safe_target(request),
+        destination_class,
+        client_profile_id,
+        started_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        status: None,
+        phase: "pending".into(),
+        duration_ms: 0,
+        request_bytes: 0,
+        response_bytes: 0,
+        request_headers: safe_headers(request.headers()),
+        response_headers: vec![],
+        error: None,
+        request_body_state: "disabled".into(),
+        request_body_error: None,
+        response_body_error: None,
+        breakpoint_state: "none".into(),
+        original_status: None,
+        replay_of,
+        response_rule_id: None,
+        response_rule_name: None,
+    });
+    if let Some(template) = replay_template {
+        state.replay_templates.insert(id, template);
+    }
+    state.status.captures = state.traffic.len();
+    state.revision += 1;
+    drop(state);
+    Arc::new(Exchange {
+        shared,
+        id,
+        started: Instant::now(),
+    })
+}
+
+fn replay_template(request: &Request<Incoming>) -> Option<ReplayTemplate> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD)
+        || !request.body().is_end_stream()
+        || request.uri().scheme_str() != Some("http")
+        || request.uri().authority().is_none()
+    {
+        return None;
+    }
+    let mut headers = request.headers().clone();
+    strip_hop_headers(&mut headers);
+    for name in [
+        HOST.as_str(),
+        "authorization",
+        "cookie",
+        "x-api-key",
+        "content-length",
+        INTERNAL_REPLAY_HEADER,
+    ] {
+        headers.remove(name);
+    }
+    Some(ReplayTemplate {
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        headers,
+    })
+}
+
+async fn replay_through_proxy(
+    address: SocketAddr,
+    token: &str,
+    template: &ReplayTemplate,
+) -> Result<(), String> {
+    let authority = template
+        .uri
+        .authority()
+        .ok_or("Replay target has no authority.")?;
+    let mut request = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\n{}: {}\r\nConnection: close\r\n",
+        template.method, template.uri, authority, INTERNAL_REPLAY_HEADER, token
+    )
+    .into_bytes();
+    for (name, value) in &template.headers {
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    timeout(Duration::from_secs(60), async move {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .map_err(|_| "Cannot connect to the running proxy for replay.")?;
+        stream
+            .write_all(&request)
+            .await
+            .map_err(|_| "Cannot send the replay request to the proxy.")?;
+        tokio::io::copy(&mut stream, &mut tokio::io::sink())
+            .await
+            .map_err(|_| "Replay response transfer failed.")?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Replay did not complete within 60 seconds.")?
+}
+
 type ForwardError = (StatusCode, &'static str);
 
 async fn forward(
-    mut request: Request<Incoming>,
+    request: Request<Incoming>,
     exchange: Arc<Exchange>,
     proxy: SocketAddr,
 ) -> Result<Response<WireBody>, ForwardError> {
@@ -976,17 +1580,67 @@ async fn forward(
         .to_string();
     let port = request.uri().port_u16().unwrap_or(80);
     let stream = connect_upstream(&host, port, proxy).await?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+    forward_connected(request, exchange, stream, authority).await
+}
+
+async fn forward_connected<S>(
+    request: Request<Incoming>,
+    exchange: Arc<Exchange>,
+    stream: S,
+    authority: Authority,
+) -> Result<Response<WireBody>, ForwardError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP handshake failed."))?;
-    let path = request
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut sender = UpstreamSender::Http1(sender);
+    forward_with_sender(
+        request,
+        exchange,
+        &mut sender,
+        authority,
+        Some(ConnectionGuard(connection)),
+    )
+    .await
+}
+
+async fn forward_with_sender(
+    mut request: Request<Incoming>,
+    exchange: Arc<Exchange>,
+    sender: &mut UpstreamSender,
+    authority: Authority,
+    connection: Option<ConnectionGuard>,
+) -> Result<Response<WireBody>, ForwardError> {
+    let rule_method = request.method().clone();
+    let rule_path = request.uri().path().to_owned();
+    let rule_host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let path: hyper::http::uri::PathAndQuery = request
         .uri()
         .path_and_query()
         .map(|v| v.as_str())
         .unwrap_or("/")
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid request path."))?;
-    *request.uri_mut() = path;
+    *request.uri_mut() = if sender.is_http2() {
+        hyper::Uri::builder()
+            .scheme("https")
+            .authority(authority.clone())
+            .path_and_query(path)
+            .build()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid HTTPS request target."))?
+    } else {
+        path.into()
+    };
     strip_hop_headers(request.headers_mut());
     request.headers_mut().insert(
         HOST,
@@ -1036,15 +1690,152 @@ async fn forward(
             redaction_paths: request_redaction_paths,
         },
     );
-    let connection = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let guard = ConnectionGuard(connection);
+    let upstream_http2 = sender.is_http2();
     let upstream = sender
         .send_request(request)
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP request failed."))?;
     let (mut parts, body) = upstream.into_parts();
+    let mut replacement_body = None;
+    let response_rule = {
+        let state = exchange.shared.lock().unwrap();
+        let can_modify = state
+            .traffic
+            .iter()
+            .find(|capture| capture.id == exchange.id)
+            .is_some_and(|capture| authorize(capture.destination_class, Action::Modify).is_ok());
+        can_modify
+            .then(|| {
+                state
+                    .response_rules
+                    .iter()
+                    .find(|rule| rule.matches(&rule_host, &rule_path, &rule_method))
+                    .cloned()
+            })
+            .flatten()
+    };
+    if let Some(rule) = response_rule {
+        let original_status = parts.status.as_u16();
+        parts.status = rule.status;
+        replacement_body = rule.body.map(|body| (body, rule.content_type));
+        exchange.update(|capture| {
+            capture.original_status = Some(original_status);
+            capture.response_rule_id = Some(rule.id);
+            capture.response_rule_name = Some(rule.name);
+        });
+    }
+    let breakpoint = {
+        let mut state = exchange.shared.lock().unwrap();
+        let enabled = state.break_on_responses
+            && state
+                .traffic
+                .iter()
+                .find(|capture| capture.id == exchange.id)
+                .is_some_and(|capture| {
+                    authorize(capture.destination_class, Action::Modify).is_ok()
+                });
+        if enabled {
+            let (sender, receiver) = oneshot::channel();
+            state.breakpoints.insert(exchange.id, sender);
+            if let Some(capture) = state
+                .traffic
+                .iter_mut()
+                .find(|capture| capture.id == exchange.id)
+            {
+                capture.breakpoint_state = "waiting".into();
+                if capture.original_status.is_none() {
+                    capture.original_status = Some(parts.status.as_u16());
+                }
+            }
+            state.revision += 1;
+            Some(receiver)
+        } else {
+            None
+        }
+    };
+    if let Some(receiver) = breakpoint {
+        let decision = timeout(Duration::from_secs(15), receiver).await;
+        exchange
+            .shared
+            .lock()
+            .unwrap()
+            .breakpoints
+            .remove(&exchange.id);
+        match decision {
+            Ok(Ok(decision)) => {
+                if let Some(status) = decision.status {
+                    parts.status = status;
+                }
+                let body_modified = decision.body.is_some();
+                if let Some(body) = decision.body {
+                    replacement_body = Some((body, decision.content_type));
+                }
+                let modified = decision.status.is_some() || body_modified;
+                exchange.update(|capture| {
+                    capture.breakpoint_state =
+                        if modified { "modified" } else { "continued" }.into()
+                });
+            }
+            _ => exchange.update(|capture| capture.breakpoint_state = "timed_out".into()),
+        }
+        exchange.shared.lock().unwrap().revision += 1;
+    }
+    if let Some((replacement, content_type)) = replacement_body {
+        strip_hop_headers(&mut parts.headers);
+        for name in [
+            "content-encoding",
+            "content-range",
+            "etag",
+            "content-md5",
+            "accept-ranges",
+        ] {
+            parts.headers.remove(name);
+        }
+        parts.headers.insert(
+            "content-length",
+            HeaderValue::from_str(&replacement.len().to_string())
+                .expect("a byte length is a valid header value"),
+        );
+        parts.headers.insert(
+            "content-type",
+            content_type.unwrap_or_else(|| HeaderValue::from_static("text/plain; charset=utf-8")),
+        );
+        if !upstream_http2 {
+            parts
+                .headers
+                .insert("connection", HeaderValue::from_static("close"));
+        }
+        exchange.update(|capture| {
+            capture.status = Some(parts.status.as_u16());
+            capture.response_headers = safe_headers(&parts.headers);
+            capture.response_bytes = replacement.len() as u64;
+        });
+        let (bodies, enabled, budget) = {
+            let state = exchange.shared.lock().unwrap();
+            (
+                state.response_bodies.clone(),
+                state.capture_bodies,
+                state.body_budget,
+            )
+        };
+        if enabled {
+            if let Err(error) = bodies
+                .store_complete(exchange.id, replacement.to_vec(), budget)
+                .await
+            {
+                exchange.update(|capture| {
+                    capture.response_body_error = Some(error);
+                });
+            }
+        }
+        exchange.finish(None);
+        return Ok(Response::from_parts(
+            parts,
+            Full::new(replacement)
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        ));
+    }
     exchange.update(|capture| {
         capture.status = Some(parts.status.as_u16());
         capture.response_headers = safe_headers(&parts.headers);
@@ -1115,7 +1906,7 @@ async fn forward(
             pending: None,
             written: 0,
         },
-        _connection: guard,
+        _connection: connection,
     };
     Ok(Response::from_parts(parts, body.boxed()))
 }
@@ -1158,7 +1949,7 @@ impl Drop for ConnectionGuard {
 
 struct ResponseBody {
     observed: RecordedBody,
-    _connection: ConnectionGuard,
+    _connection: Option<ConnectionGuard>,
 }
 impl Body for ResponseBody {
     type Data = Bytes;
@@ -1230,5 +2021,451 @@ mod destination_tests {
             &["*.example.com".into()]
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod tls_listener_tests {
+    use super::*;
+    use crate::HTTP1_ALPN;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        rustls::{
+            pki_types::{PrivatePkcs8KeyDer, ServerName},
+            RootCertStore, ServerConfig,
+        },
+        TlsAcceptor, TlsConnector,
+    };
+
+    fn test_interception(
+        leaf: IssuedLeaf,
+        upstream_config: Arc<ClientConfig>,
+    ) -> ProxyTlsInterception {
+        let leaf = Arc::new(Mutex::new(Some(leaf)));
+        ProxyTlsInterception {
+            profile_id: "browser-1".into(),
+            upstream_config,
+            issue_leaf: Arc::new(move |_, destination| {
+                assert_eq!(destination, DestinationClass::Development);
+                Ok(leaf.lock().unwrap().take())
+            }),
+        }
+    }
+
+    async fn response_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            bytes.push(stream.read_u8().await.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn http_message<S: AsyncRead + Unpin>(stream: &mut S) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            bytes.push(stream.read_u8().await.unwrap());
+        }
+        let headers_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = String::from_utf8(bytes[..headers_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        bytes.resize(headers_end + content_length, 0);
+        stream.read_exact(&mut bytes[headers_end..]).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_development_connect_captures_inner_http_safely() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let upstream_identity =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let mut upstream_server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![upstream_identity.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(upstream_identity.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        upstream_server_config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let mut upstream_roots = RootCertStore::empty();
+        upstream_roots
+            .add(upstream_identity.cert.der().clone())
+            .unwrap();
+        let mut upstream_client_config = ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth();
+        upstream_client_config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let upstream_client_config = Arc::new(upstream_client_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = TlsAcceptor::from(Arc::new(upstream_server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP1_ALPN));
+            let request = http_message(&mut tls).await;
+            assert!(request.starts_with("POST /submit?token=secret HTTP/1.1\r\n"));
+            let lowercase_request = request.to_ascii_lowercase();
+            assert!(lowercase_request.contains(&format!("host: 127.0.0.1:{upstream_port}\r\n")));
+            assert!(!lowercase_request.contains("proxy-authorization"));
+            assert!(request.contains(r#"{"password":"secret","value":"safe"}"#));
+            tls.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+            let request = http_message(&mut tls).await;
+            assert!(request.starts_with("GET /second?key=secret HTTP/1.1\r\n"));
+            let lowercase_request = request.to_ascii_lowercase();
+            assert!(lowercase_request.contains(&format!("host: 127.0.0.1:{upstream_port}\r\n")));
+            assert!(!lowercase_request.contains("proxy-authorization"));
+            tls.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"sequence\":2}",
+            )
+            .await
+            .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("127.0.0.1");
+        let engine = ProxyEngine::default();
+        let snapshot = engine
+            .start(ProxyConfig {
+                port: 0,
+                client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
+                tls_interception: Some(test_interception(leaf, upstream_client_config)),
+                capture_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(snapshot.status.https_inspection);
+        let mut client = TcpStream::connect(snapshot.status.listen_address)
+            .await
+            .unwrap();
+        let credentials = BASE64.encode(format!("browser-1:{TOKEN}"));
+        client
+            .write_all(
+                format!("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(response_headers(&mut client)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        let mut downstream_roots = RootCertStore::empty();
+        downstream_roots
+            .add(
+                rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut downstream_config = ClientConfig::builder()
+            .with_root_certificates(downstream_roots)
+            .with_no_client_auth();
+        downstream_config.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let mut tls = TlsConnector::from(Arc::new(downstream_config))
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP1_ALPN));
+        let body = r#"{"password":"secret","value":"safe"}"#;
+        tls.write_all(
+            format!(
+                "POST /submit?token=secret HTTP/1.1\r\nHost: wrong.example\r\nAuthorization: Bearer inner-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        let reply = http_message(&mut tls).await;
+        assert!(reply.starts_with("HTTP/1.1 201 Created"));
+        assert!(reply.ends_with(r#"{"ok":true}"#));
+        tls.write_all(
+            b"GET /second?key=secret HTTP/1.1\r\nHost: another-wrong.example\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        let reply = http_message(&mut tls).await;
+        assert!(reply.starts_with("HTTP/1.1 202 Accepted"));
+        assert!(reply.ends_with(r#"{"sequence":2}"#));
+        upstream.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while {
+                let snapshot = engine.snapshot();
+                snapshot.traffic.len() != 2
+                    || snapshot.traffic.iter().any(|capture| {
+                        capture.phase == "pending" || capture.request_body_state == "recording"
+                    })
+            } {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = engine.snapshot();
+        let first_capture_id = snapshot.traffic[1].id;
+        let request_body = engine
+            .request_body_page(first_capture_id, 0, 1024)
+            .await
+            .unwrap();
+        let response_body = engine
+            .response_body_page(first_capture_id, 0, 1024)
+            .await
+            .unwrap();
+        let second_response_body = engine
+            .response_body_page(snapshot.traffic[0].id, 0, 1024)
+            .await
+            .unwrap();
+        let snapshot = engine.stop().await;
+        assert!(!snapshot.status.https_inspection);
+        let first = &snapshot.traffic[1];
+        assert_eq!(first.kind, "https");
+        assert_eq!(first.method, "POST");
+        assert_eq!(
+            first.target,
+            format!("127.0.0.1:{upstream_port}/submit?[REDACTED]")
+        );
+        assert_eq!(first.status, Some(201));
+        assert_eq!(first.request_bytes, body.len() as u64);
+        assert_eq!(first.response_bytes, 11);
+        assert!(first
+            .request_headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && value == "[REDACTED]"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request_body.bytes).unwrap(),
+            serde_json::json!({"password": "[REDACTED]", "value": "safe"})
+        );
+        assert_eq!(
+            String::from_utf8(response_body.bytes).unwrap(),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(first.phase, "complete");
+        let second = &snapshot.traffic[0];
+        assert_eq!(second.kind, "https");
+        assert_eq!(second.method, "GET");
+        assert_eq!(
+            second.target,
+            format!("127.0.0.1:{upstream_port}/second?[REDACTED]")
+        );
+        assert_eq!(second.status, Some(202));
+        assert_eq!(second.response_bytes, 14);
+        assert_eq!(
+            String::from_utf8(second_response_body.bytes).unwrap(),
+            r#"{"sequence":2}"#
+        );
+        assert_eq!(second.phase, "complete");
+    }
+
+    #[tokio::test]
+    async fn authenticated_development_connect_captures_multiplexed_http2_streams() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let identity = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.cert.der().clone()).unwrap();
+        let mut upstream_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        upstream_config.alpn_protocols = vec![HTTP2_ALPN.to_vec(), HTTP1_ALPN.to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let tls = TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP2_ALPN));
+            let service = service_fn(|request: Request<Incoming>| async move {
+                let status = if request.uri().path() == "/one" {
+                    201
+                } else {
+                    202
+                };
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let mut response = Response::new(Full::new(body));
+                *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                Ok::<_, Infallible>(response)
+            });
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await
+        });
+
+        let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("127.0.0.1");
+        let engine = ProxyEngine::default();
+        let snapshot = engine
+            .start(ProxyConfig {
+                port: 0,
+                client_auth: Some(ProxyClientAuth::new("browser-1", TOKEN).unwrap()),
+                tls_interception: Some(test_interception(leaf, Arc::new(upstream_config))),
+                capture_bodies: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(snapshot.status.listen_address)
+            .await
+            .unwrap();
+        let credentials = BASE64.encode(format!("browser-1:{TOKEN}"));
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nProxy-Authorization: Basic {credentials}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(response_headers(&mut client)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let tls = TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), client)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(HTTP2_ALPN));
+        let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        let connection = tokio::spawn(connection);
+        let mut first_sender = sender.clone();
+        let mut second_sender = sender;
+        let first = Request::post(format!("https://127.0.0.1:{upstream_port}/one?token=a"))
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{\"password\":\"secret\"}")))
+            .unwrap();
+        let second = Request::get(format!("https://127.0.0.1:{upstream_port}/two?token=b"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (first, second) = tokio::join!(
+            first_sender.send_request(first),
+            second_sender.send_request(second)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.status(), 201);
+        assert_eq!(second.status(), 202);
+        first.into_body().collect().await.unwrap();
+        second.into_body().collect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while {
+                let snapshot = engine.snapshot();
+                snapshot.traffic.len() != 2
+                    || snapshot
+                        .traffic
+                        .iter()
+                        .any(|capture| capture.phase == "pending")
+            } {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = engine.stop().await;
+        assert_eq!(snapshot.traffic.len(), 2);
+        assert!(snapshot
+            .traffic
+            .iter()
+            .all(|capture| capture.kind == "https"));
+        assert!(snapshot
+            .traffic
+            .iter()
+            .any(|capture| capture.status == Some(201)));
+        assert!(snapshot
+            .traffic
+            .iter()
+            .any(|capture| capture.status == Some(202)));
+        connection.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn interception_route_rejects_non_development_and_mismatched_profiles() {
+        let called = Arc::new(AtomicBool::new(false));
+        let issuer_called = called.clone();
+        let interception = ProxyTlsInterception {
+            profile_id: "browser-1".into(),
+            upstream_config: Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+            issue_leaf: Arc::new(move |_, _| {
+                issuer_called.store(true, Ordering::SeqCst);
+                Ok(None)
+            }),
+        };
+        assert!(interception
+            .prepare(
+                "api.example.com",
+                DestinationClass::Production,
+                Some("browser-1"),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(interception
+            .prepare(
+                "api.dev.example",
+                DestinationClass::Development,
+                Some("other-client"),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(ProxyEngine::default()
+            .start(ProxyConfig {
+                port: 0,
+                client_auth: Some(
+                    ProxyClientAuth::new("other-client", "0123456789abcdef0123456789abcdef",)
+                        .unwrap(),
+                ),
+                tls_interception: Some(interception),
+                ..Default::default()
+            })
+            .await
+            .is_err());
     }
 }

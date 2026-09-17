@@ -26,11 +26,182 @@ type CaStatus = {
 };
 type TlsTrustCheckStatus = {
   state: "idle" | "waiting" | "verified" | "failed" | "expired";
+  client: TlsClientProfile | null;
   url: string | null;
   expiresAt: number | null;
   verifiedAt: number | null;
   error: string | null;
 };
+type TlsClientProfile = {
+  id: string;
+  name: string;
+};
+type ProxyCredential = {
+  profileId: string;
+  token: string;
+};
+type ResponseRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  host: string;
+  pathPrefix: string;
+  method: "*" | "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
+  status: number;
+  replaceBody: boolean;
+  body: string;
+  contentType: string;
+};
+type WorkspaceSettings = {
+  port: string;
+  captureBodies: boolean;
+  breakOnResponses: boolean;
+  diskBudget: string;
+  redactionPaths: string;
+  developmentHosts: string;
+  productionHosts: string;
+  requireClientAuth: boolean;
+  selectedClientId: string;
+};
+type TlsInspectionPreflight = {
+  state:
+    | "proxy_stopped"
+    | "client_authentication_required"
+    | "disabled"
+    | "missing_ca"
+    | "expired_ca"
+    | "client_trust_unverified"
+    | "client_mismatch"
+    | "ready";
+  canEnableDevelopment: boolean;
+  httpsInspectionActive: boolean;
+  clientProfileId: string | null;
+  verifiedClient: TlsClientProfile | null;
+  proofExpiresAt: number | null;
+};
+
+const clientProfilesKey = "sippin-tls-client-profiles";
+const responseRulesKey = "sippin-response-rules-v1";
+const workspaceSettingsKey = "sippin-workspace-settings-v1";
+const defaultWorkspaceSettings: WorkspaceSettings = {
+  port: "8080",
+  captureBodies: false,
+  breakOnResponses: false,
+  diskBudget: "10",
+  redactionPaths: "",
+  developmentHosts: "",
+  productionHosts: "",
+  requireClientAuth: false,
+  selectedClientId: "",
+};
+
+function loadClientProfiles(): TlsClientProfile[] {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(clientProfilesKey) ?? "[]",
+    );
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (profile): profile is TlsClientProfile =>
+        typeof profile === "object" &&
+        profile !== null &&
+        typeof (profile as TlsClientProfile).id === "string" &&
+        typeof (profile as TlsClientProfile).name === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function loadResponseRules(): ResponseRule[] {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(responseRulesKey) ?? "[]",
+    );
+    if (!Array.isArray(value)) return [];
+    return value
+      .slice(0, 64)
+      .filter(
+        (rule): rule is ResponseRule =>
+          typeof rule === "object" &&
+          rule !== null &&
+          typeof (rule as ResponseRule).id === "string" &&
+          typeof (rule as ResponseRule).name === "string" &&
+          typeof (rule as ResponseRule).enabled === "boolean" &&
+          typeof (rule as ResponseRule).host === "string" &&
+          typeof (rule as ResponseRule).pathPrefix === "string" &&
+          ["*", "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(
+            (rule as ResponseRule).method,
+          ) &&
+          typeof (rule as ResponseRule).status === "number",
+      )
+      .map((rule) => ({
+        ...rule,
+        replaceBody:
+          typeof rule.replaceBody === "boolean" ? rule.replaceBody : false,
+        body: typeof rule.body === "string" ? rule.body : "",
+        contentType:
+          typeof rule.contentType === "string"
+            ? rule.contentType
+            : "application/json",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function loadWorkspaceSettings(): WorkspaceSettings {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(workspaceSettingsKey) ?? "{}",
+    );
+    if (typeof value !== "object" || value === null) {
+      return defaultWorkspaceSettings;
+    }
+    const stored = value as Partial<WorkspaceSettings>;
+    return {
+      port:
+        typeof stored.port === "string"
+          ? stored.port
+          : defaultWorkspaceSettings.port,
+      captureBodies:
+        typeof stored.captureBodies === "boolean"
+          ? stored.captureBodies
+          : defaultWorkspaceSettings.captureBodies,
+      breakOnResponses:
+        typeof stored.breakOnResponses === "boolean"
+          ? stored.breakOnResponses
+          : defaultWorkspaceSettings.breakOnResponses,
+      diskBudget:
+        typeof stored.diskBudget === "string"
+          ? stored.diskBudget
+          : defaultWorkspaceSettings.diskBudget,
+      redactionPaths:
+        typeof stored.redactionPaths === "string"
+          ? stored.redactionPaths
+          : defaultWorkspaceSettings.redactionPaths,
+      developmentHosts:
+        typeof stored.developmentHosts === "string"
+          ? stored.developmentHosts
+          : defaultWorkspaceSettings.developmentHosts,
+      productionHosts:
+        typeof stored.productionHosts === "string"
+          ? stored.productionHosts
+          : defaultWorkspaceSettings.productionHosts,
+      requireClientAuth:
+        typeof stored.requireClientAuth === "boolean"
+          ? stored.requireClientAuth
+          : defaultWorkspaceSettings.requireClientAuth,
+      selectedClientId:
+        typeof stored.selectedClientId === "string"
+          ? stored.selectedClientId
+          : defaultWorkspaceSettings.selectedClientId,
+    };
+  } catch {
+    return defaultWorkspaceSettings;
+  }
+}
+const initialWorkspaceSettings = loadWorkspaceSettings();
 const descriptions: Record<Section, string> = {
   Traffic: "Your application’s traffic, in one place.",
   Collections: "Compose requests and keep repeatable workflows together.",
@@ -80,12 +251,26 @@ function App() {
   const { snapshot, error, busy, command, desktop } = useEngine();
   const status = snapshot?.status;
   const running = status?.phase === "running";
-  const [port, setPort] = useState("8080");
-  const [captureBodies, setCaptureBodies] = useState(false);
-  const [diskBudget, setDiskBudget] = useState("10");
-  const [redactionPaths, setRedactionPaths] = useState("");
-  const [developmentHosts, setDevelopmentHosts] = useState("");
-  const [productionHosts, setProductionHosts] = useState("");
+  const [port, setPort] = useState(initialWorkspaceSettings.port);
+  const [captureBodies, setCaptureBodies] = useState(
+    initialWorkspaceSettings.captureBodies,
+  );
+  const [breakOnResponses, setBreakOnResponses] = useState(
+    initialWorkspaceSettings.breakOnResponses,
+  );
+  const [diskBudget, setDiskBudget] = useState(
+    initialWorkspaceSettings.diskBudget,
+  );
+  const [redactionPaths, setRedactionPaths] = useState(
+    initialWorkspaceSettings.redactionPaths,
+  );
+  const [developmentHosts, setDevelopmentHosts] = useState(
+    initialWorkspaceSettings.developmentHosts,
+  );
+  const [productionHosts, setProductionHosts] = useState(
+    initialWorkspaceSettings.productionHosts,
+  );
+  const [responseRules, setResponseRules] = useState(loadResponseRules);
   const [caStatus, setCaStatus] = useState<CaStatus | null>(null);
   const [caConsent, setCaConsent] = useState(false);
   const [caRemoveConfirmed, setCaRemoveConfirmed] = useState(false);
@@ -96,6 +281,28 @@ function App() {
   );
   const [trustCheckConsent, setTrustCheckConsent] = useState(false);
   const [trustCheckBusy, setTrustCheckBusy] = useState(false);
+  const [clientProfiles, setClientProfiles] = useState(loadClientProfiles);
+  const [selectedClientId, setSelectedClientId] = useState(() =>
+    loadClientProfiles().some(
+      (profile) => profile.id === initialWorkspaceSettings.selectedClientId,
+    )
+      ? initialWorkspaceSettings.selectedClientId
+      : (loadClientProfiles()[0]?.id ?? ""),
+  );
+  const [newClientName, setNewClientName] = useState("");
+  const [requireClientAuth, setRequireClientAuth] = useState(
+    initialWorkspaceSettings.requireClientAuth,
+  );
+  const [enableHttpsInspection, setEnableHttpsInspection] = useState(false);
+  const [proxyCredential, setProxyCredential] =
+    useState<ProxyCredential | null>(null);
+  const [tlsPreflight, setTlsPreflight] =
+    useState<TlsInspectionPreflight | null>(null);
+  const selectedClient =
+    clientProfiles.find((profile) => profile.id === selectedClientId) ?? null;
+  const activeProxyClient =
+    clientProfiles.find((profile) => profile.id === status?.clientProfileId) ??
+    null;
   const parseHostRules = (value: string) =>
     value
       .split(/[\n,]/)
@@ -114,6 +321,28 @@ function App() {
     [...parsedDevelopmentHosts, ...parsedProductionHosts].every(
       hostRuleIsPlausible,
     );
+  const validResponseRules =
+    responseRules.length <= 64 &&
+    new Set(responseRules.map((rule) => rule.id)).size ===
+      responseRules.length &&
+    responseRules.every(
+      (rule) =>
+        rule.name.trim().length >= 1 &&
+        rule.name.trim().length <= 80 &&
+        hostRuleIsPlausible(rule.host) &&
+        rule.host.length > 0 &&
+        rule.pathPrefix.startsWith("/") &&
+        rule.pathPrefix.length <= 1024 &&
+        Number.isInteger(rule.status) &&
+        rule.status >= 200 &&
+        rule.status <= 599 &&
+        ![204, 205, 304].includes(rule.status) &&
+        (!rule.replaceBody ||
+          (new TextEncoder().encode(rule.body).length <= 65536 &&
+            rule.contentType.trim().length >= 1 &&
+            rule.contentType.length <= 128 &&
+            !/[\r\n]/.test(rule.contentType))),
+    );
   const parsedRedactionPaths = redactionPaths
     .split(/[\n,]/)
     .map((path) => path.trim())
@@ -129,22 +358,142 @@ function App() {
     Number(diskBudget) <= 1024;
   const validPort =
     /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+  const canRequestHttpsInspection =
+    requireClientAuth &&
+    selectedClient !== null &&
+    caStatus?.state === "ready" &&
+    (caStatus.expiresAt ?? 0) > Date.now() &&
+    trustCheck?.state === "verified" &&
+    trustCheck.client?.id === selectedClient.id &&
+    (trustCheck.expiresAt ?? 0) > Date.now();
+  const preflightMessage: Record<TlsInspectionPreflight["state"], string> = {
+    proxy_stopped: "Start the proxy before evaluating HTTPS inspection.",
+    client_authentication_required:
+      "Start the proxy with client profile authentication.",
+    disabled: "HTTPS inspection has not been explicitly enabled.",
+    missing_ca: "Generate the local development CA first.",
+    expired_ca: "The local development CA has expired.",
+    client_trust_unverified:
+      "Run the trust check with the authenticated client profile.",
+    client_mismatch:
+      "The authenticated proxy profile does not match the verified client.",
+    ready:
+      "Proxy identity and TLS trust proof match for Development HTTPS inspection.",
+  };
+
+  const createClientToken = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+  };
+
+  const proxyCommand = async () => {
+    if (running) {
+      if (await command("stop_proxy")) setProxyCredential(null);
+      return;
+    }
+    const credential =
+      requireClientAuth && selectedClient
+        ? { profileId: selectedClient.id, token: createClientToken() }
+        : null;
+    const started = await command("start_proxy", {
+      options: {
+        port: Number(port),
+        captureBodies,
+        diskBudgetGib: Number(diskBudget),
+        requestRedactionPaths: parsedRedactionPaths,
+        developmentHosts: parsedDevelopmentHosts,
+        productionHosts: parsedProductionHosts,
+        clientProfileId: credential?.profileId ?? null,
+        clientToken: credential?.token ?? null,
+        enableHttpsInspection,
+        breakOnResponses,
+        responseRules: responseRules.map((rule) => ({
+          id: rule.id,
+          name: rule.name,
+          enabled: rule.enabled,
+          host: rule.host,
+          pathPrefix: rule.pathPrefix,
+          method: rule.method === "*" ? null : rule.method,
+          status: rule.status,
+          body: rule.replaceBody ? rule.body : null,
+          contentType: rule.replaceBody ? rule.contentType : null,
+        })),
+      },
+    });
+    setProxyCredential(started ? credential : null);
+  };
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("sippin-theme", theme);
   }, [theme]);
   useEffect(() => {
+    localStorage.setItem(clientProfilesKey, JSON.stringify(clientProfiles));
+    if (
+      selectedClientId &&
+      !clientProfiles.some((profile) => profile.id === selectedClientId)
+    ) {
+      setSelectedClientId(clientProfiles[0]?.id ?? "");
+    }
+  }, [clientProfiles, selectedClientId]);
+  useEffect(() => {
+    localStorage.setItem(responseRulesKey, JSON.stringify(responseRules));
+  }, [responseRules]);
+  useEffect(() => {
+    if (!validPort || !validBudget || !validRedactionPaths || !validHostRules) {
+      return;
+    }
+    try {
+      localStorage.setItem(
+        workspaceSettingsKey,
+        JSON.stringify({
+          port,
+          captureBodies,
+          breakOnResponses,
+          diskBudget,
+          redactionPaths,
+          developmentHosts,
+          productionHosts,
+          requireClientAuth,
+          selectedClientId,
+        } satisfies WorkspaceSettings),
+      );
+    } catch {
+      // The controls remain usable for this run when webview storage is unavailable.
+    }
+  }, [
+    port,
+    captureBodies,
+    breakOnResponses,
+    diskBudget,
+    redactionPaths,
+    developmentHosts,
+    productionHosts,
+    requireClientAuth,
+    selectedClientId,
+    validPort,
+    validBudget,
+    validRedactionPaths,
+    validHostRules,
+  ]);
+  useEffect(() => {
+    if (!canRequestHttpsInspection) setEnableHttpsInspection(false);
+  }, [canRequestHttpsInspection]);
+  useEffect(() => {
     if (!desktop) return;
     let active = true;
     void Promise.all([
       invoke<CaStatus>("ca_status"),
       invoke<TlsTrustCheckStatus>("tls_trust_check_status"),
+      invoke<TlsInspectionPreflight>("tls_inspection_preflight"),
     ])
-      .then(([nextCa, nextTrust]) => {
+      .then(([nextCa, nextTrust, nextPreflight]) => {
         if (active) {
           setCaStatus(nextCa);
           setTrustCheck(nextTrust);
+          setTlsPreflight(nextPreflight);
         }
       })
       .catch((cause) => {
@@ -154,6 +503,21 @@ function App() {
       active = false;
     };
   }, [desktop]);
+  useEffect(() => {
+    if (!desktop) return;
+    void invoke<TlsInspectionPreflight>("tls_inspection_preflight")
+      .then(setTlsPreflight)
+      .catch((cause) => setCaMessage(String(cause)));
+  }, [desktop, snapshot?.revision, trustCheck?.state]);
+  useEffect(() => {
+    if (!desktop || !status?.httpsInspection) return;
+    const timer = window.setInterval(() => {
+      void invoke<TlsInspectionPreflight>("tls_inspection_preflight")
+        .then(setTlsPreflight)
+        .catch((cause) => setCaMessage(String(cause)));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [desktop, status?.httpsInspection]);
   useEffect(() => {
     if (!desktop || trustCheck?.state !== "waiting") return;
     const timer = window.setInterval(() => {
@@ -193,7 +557,18 @@ function App() {
     setTrustCheckBusy(true);
     setCaMessage("");
     try {
-      const next = await invoke<TlsTrustCheckStatus>(name);
+      if (name === "start_tls_trust_check" && !selectedClient) {
+        throw new Error("Choose a client profile before starting the check.");
+      }
+      const next = await invoke<TlsTrustCheckStatus>(
+        name,
+        name === "start_tls_trust_check"
+          ? {
+              clientId: selectedClient!.id,
+              clientName: selectedClient!.name,
+            }
+          : undefined,
+      );
       setTrustCheck(next);
       setTrustCheckConsent(false);
     } catch (cause) {
@@ -201,6 +576,23 @@ function App() {
     } finally {
       setTrustCheckBusy(false);
     }
+  };
+  const addClientProfile = () => {
+    const name = newClientName.trim();
+    if (!name || name.length > 80) return;
+    const profile = { id: crypto.randomUUID(), name };
+    setClientProfiles((current) => [...current, profile]);
+    setSelectedClientId(profile.id);
+    setNewClientName("");
+  };
+  const removeSelectedClient = () => {
+    if (!selectedClient || running) return;
+    if (trustCheck?.client?.id === selectedClient.id) {
+      void trustCheckCommand("cancel_tls_trust_check");
+    }
+    setClientProfiles((current) =>
+      current.filter((profile) => profile.id !== selectedClient.id),
+    );
   };
   const copyTrustCheckUrl = async () => {
     if (!trustCheck?.url) return;
@@ -230,6 +622,53 @@ function App() {
     } finally {
       setCaBusy(false);
     }
+  };
+  const addResponseRule = () => {
+    if (running || responseRules.length >= 64) return;
+    setResponseRules((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        name: `Response rule ${current.length + 1}`,
+        enabled: true,
+        host: "127.0.0.1",
+        pathPrefix: "/",
+        method: "GET",
+        status: 503,
+        replaceBody: false,
+        body: '{\n  "error": "service unavailable"\n}',
+        contentType: "application/json",
+      },
+    ]);
+  };
+  const updateResponseRule = (id: string, update: Partial<ResponseRule>) => {
+    if (running) return;
+    setResponseRules((current) =>
+      current.map((rule) => (rule.id === id ? { ...rule, ...update } : rule)),
+    );
+  };
+  const moveResponseRule = (index: number, offset: number) => {
+    if (running) return;
+    setResponseRules((current) => {
+      const target = index + offset;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
+  const resetWorkspaceSettings = () => {
+    if (running) return;
+    setPort(defaultWorkspaceSettings.port);
+    setCaptureBodies(defaultWorkspaceSettings.captureBodies);
+    setBreakOnResponses(defaultWorkspaceSettings.breakOnResponses);
+    setDiskBudget(defaultWorkspaceSettings.diskBudget);
+    setRedactionPaths(defaultWorkspaceSettings.redactionPaths);
+    setDevelopmentHosts(defaultWorkspaceSettings.developmentHosts);
+    setProductionHosts(defaultWorkspaceSettings.productionHosts);
+    setRequireClientAuth(defaultWorkspaceSettings.requireClientAuth);
+    setSelectedClientId(clientProfiles[0]?.id ?? "");
+    setEnableHttpsInspection(false);
   };
 
   return (
@@ -317,23 +756,12 @@ function App() {
                     (!validPort ||
                       !validBudget ||
                       !validRedactionPaths ||
-                      !validHostRules))
+                      !validHostRules ||
+                      !validResponseRules ||
+                      (requireClientAuth && !selectedClient) ||
+                      (enableHttpsInspection && !canRequestHttpsInspection)))
                 }
-                onClick={() =>
-                  void command(
-                    running ? "stop_proxy" : "start_proxy",
-                    running
-                      ? undefined
-                      : {
-                          port: Number(port),
-                          captureBodies,
-                          diskBudgetGib: Number(diskBudget),
-                          requestRedactionPaths: parsedRedactionPaths,
-                          developmentHosts: parsedDevelopmentHosts,
-                          productionHosts: parsedProductionHosts,
-                        },
-                  )
-                }
+                onClick={() => void proxyCommand()}
               >
                 {busy ? "Please wait…" : running ? "Stop proxy" : "Start proxy"}
               </button>
@@ -357,6 +785,116 @@ function App() {
                 />{" "}
                 Record HTTP bodies
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={breakOnResponses}
+                  disabled={running || busy || !desktop}
+                  onChange={(event) =>
+                    setBreakOnResponses(event.target.checked)
+                  }
+                />{" "}
+                Pause Development responses for 15 seconds
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={requireClientAuth}
+                  disabled={running || busy || !desktop}
+                  onChange={(event) =>
+                    setRequireClientAuth(event.target.checked)
+                  }
+                />{" "}
+                Require client profile authentication
+              </label>
+              {requireClientAuth && (
+                <label>
+                  Authenticated client profile{" "}
+                  <select
+                    value={selectedClientId}
+                    disabled={running || busy || !desktop}
+                    onChange={(event) =>
+                      setSelectedClientId(event.target.value)
+                    }
+                  >
+                    <option value="">Choose a configured client</option>
+                    {clientProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {requireClientAuth && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={enableHttpsInspection}
+                    disabled={
+                      running || busy || !desktop || !canRequestHttpsInspection
+                    }
+                    onChange={(event) =>
+                      setEnableHttpsInspection(event.target.checked)
+                    }
+                  />{" "}
+                  Explicitly enable TLS termination for authenticated
+                  Development CONNECT destinations and inspect their negotiated
+                  HTTP/1.1 or HTTP/2 exchanges.
+                </label>
+              )}
+              {running && proxyCredential && (
+                <div className="proxy-credential" role="status">
+                  <strong>
+                    Authentication required for{" "}
+                    {activeProxyClient?.name ?? "client"}
+                  </strong>
+                  <p>
+                    Configure HTTP Basic proxy credentials with username{" "}
+                    <code>{proxyCredential.profileId}</code> and this ephemeral
+                    password:
+                  </p>
+                  <code className="trust-check-url">
+                    {proxyCredential.token}
+                  </code>
+                  <p>
+                    The password exists only for this proxy run and is not
+                    included in captures.
+                  </p>
+                </div>
+              )}
+              {running && status?.clientProfileId && !proxyCredential && (
+                <p className="error" role="alert">
+                  This proxy run requires client authentication, but its
+                  ephemeral password is no longer available in the UI. Stop and
+                  restart the proxy to generate a new credential.
+                </p>
+              )}
+              {running && status?.clientProfileId && tlsPreflight && (
+                <div
+                  className={`tls-preflight ${tlsPreflight.canEnableDevelopment ? "ready" : "blocked"}`}
+                  role="status"
+                >
+                  <strong>
+                    HTTPS inspection preflight: {tlsPreflight.state}
+                  </strong>
+                  <p>
+                    {tlsPreflight.httpsInspectionActive
+                      ? "Development CONNECT destinations use the verified TLS bridge with inner HTTP capture."
+                      : preflightMessage[tlsPreflight.state]}
+                  </p>
+                  {tlsPreflight.proofExpiresAt && (
+                    <p>
+                      Trust proof expires{" "}
+                      {new Date(tlsPreflight.proofExpiresAt).toLocaleString()}.
+                    </p>
+                  )}
+                  <p>
+                    HTTPS inspection active:{" "}
+                    {tlsPreflight.httpsInspectionActive ? "yes" : "no"}.
+                  </p>
+                </div>
+              )}
               <label>
                 Session disk budget (GiB){" "}
                 <input
@@ -437,9 +975,249 @@ function App() {
               snapshot={snapshot}
               desktop={desktop}
               busy={busy}
+              proxyCredential={proxyCredential}
               clear={() => void command("clear_traffic")}
+              replay={(id) => void command("replay_capture", { id })}
+              resolveBreakpoint={(
+                id,
+                status,
+                body = null,
+                contentType = null,
+              ) =>
+                void command("resolve_response_breakpoint", {
+                  id,
+                  status,
+                  body,
+                  contentType,
+                })
+              }
             />
           </>
+        ) : section === "Rules" ? (
+          <div className="rules-panel">
+            <div className="rules-toolbar">
+              <div>
+                <h2>Development response rules</h2>
+                <p>
+                  The first enabled rule matching host, path prefix and method
+                  replaces the upstream response status.
+                </p>
+              </div>
+              <button
+                className="primary"
+                disabled={running || responseRules.length >= 64}
+                onClick={addResponseRule}
+              >
+                Add rule
+              </button>
+            </div>
+            {running && (
+              <p className="capture-notice">
+                Rules are locked while the proxy is running. Stop and restart
+                the proxy to apply saved changes.
+              </p>
+            )}
+            {!validResponseRules && (
+              <p className="error" role="alert">
+                Every rule needs a name, a valid exact/wildcard host, a path
+                beginning with / and a body-compatible status from 200 to 599
+                (not 204, 205 or 304). Replacement bodies must be valid header
+                metadata and no larger than 64 KiB.
+              </p>
+            )}
+            {responseRules.length ? (
+              <div className="rule-list">
+                {responseRules.map((rule, index) => (
+                  <article className="rule-card" key={rule.id}>
+                    <div className="rule-card-heading">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={rule.enabled}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              enabled: event.target.checked,
+                            })
+                          }
+                        />{" "}
+                        Enabled
+                      </label>
+                      <span>Priority {index + 1}</span>
+                    </div>
+                    <div className="rule-fields">
+                      <label>
+                        Name
+                        <input
+                          value={rule.name}
+                          maxLength={80}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              name: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Host
+                        <input
+                          value={rule.host}
+                          maxLength={253}
+                          disabled={running}
+                          placeholder="127.0.0.1"
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              host: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Path prefix
+                        <input
+                          value={rule.pathPrefix}
+                          maxLength={1024}
+                          disabled={running}
+                          placeholder="/api/"
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              pathPrefix: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Method
+                        <select
+                          value={rule.method}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              method: event.target
+                                .value as ResponseRule["method"],
+                            })
+                          }
+                        >
+                          {[
+                            "*",
+                            "GET",
+                            "HEAD",
+                            "POST",
+                            "PUT",
+                            "PATCH",
+                            "DELETE",
+                          ].map((method) => (
+                            <option key={method} value={method}>
+                              {method === "*" ? "Any" : method}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Return status
+                        <input
+                          type="number"
+                          min="200"
+                          max="599"
+                          value={rule.status}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              status: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="rule-body-action">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={rule.replaceBody}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              replaceBody: event.target.checked,
+                            })
+                          }
+                        />{" "}
+                        Replace response body
+                      </label>
+                      {rule.replaceBody && (
+                        <div className="rule-body-fields">
+                          <label>
+                            Content-Type
+                            <input
+                              value={rule.contentType}
+                              maxLength={128}
+                              disabled={running}
+                              onChange={(event) =>
+                                updateResponseRule(rule.id, {
+                                  contentType: event.target.value,
+                                })
+                              }
+                            />
+                          </label>
+                          <label>
+                            UTF-8 body (max 64 KiB)
+                            <textarea
+                              rows={6}
+                              value={rule.body}
+                              disabled={running}
+                              onChange={(event) =>
+                                updateResponseRule(rule.id, {
+                                  body: event.target.value,
+                                })
+                              }
+                            />
+                          </label>
+                        </div>
+                      )}
+                    </div>
+                    <div className="rule-actions">
+                      <button
+                        disabled={running || index === 0}
+                        onClick={() => moveResponseRule(index, -1)}
+                      >
+                        Move up
+                      </button>
+                      <button
+                        disabled={running || index === responseRules.length - 1}
+                        onClick={() => moveResponseRule(index, 1)}
+                      >
+                        Move down
+                      </button>
+                      <button
+                        disabled={running}
+                        onClick={() =>
+                          setResponseRules((current) =>
+                            current.filter((item) => item.id !== rule.id),
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="planned-panel compact">
+                <span className="eyebrow">NO RULES YET</span>
+                <h2>Turn a repeated response into one click.</h2>
+                <p>
+                  Add a Development-only rule, then start the proxy to apply it.
+                  Rules are saved on this device.
+                </p>
+              </div>
+            )}
+            <p className="muted rules-footnote">
+              Rules never run for Production or Unknown destinations. They can
+              replace status and a bounded UTF-8 body; without body replacement,
+              upstream headers and content remain unchanged.
+            </p>
+          </div>
         ) : section === "Settings" ? (
           <div className="settings-panel">
             <h2>Appearance</h2>
@@ -468,12 +1246,26 @@ function App() {
               <dd>{status?.listenAddress ?? "127.0.0.1:8080"}</dd>
               <dt>HTTPS inspection</dt>
               <dd>
-                {caStatus?.state === "ready"
-                  ? "Disabled · local CA generated but not installed"
-                  : "Disabled · no local CA generated"}
+                {status?.httpsInspection
+                  ? "Enabled · Development TLS termination only"
+                  : caStatus?.state === "ready"
+                    ? "Disabled · local CA generated but not installed"
+                    : "Disabled · no local CA generated"}
               </dd>
               <dt>HTTPS pass-through</dt>
               <dd>CONNECT supported · 5 minute tunnel limit</dd>
+              <dt>Client authentication</dt>
+              <dd>
+                {status?.clientProfileId
+                  ? `Required · ${status.clientProfileId}`
+                  : "Optional · disabled for this proxy run"}
+              </dd>
+              <dt>Inspection preflight</dt>
+              <dd>
+                {tlsPreflight
+                  ? `${tlsPreflight.state} · HTTPS inspection ${tlsPreflight.httpsInspectionActive ? "active" : "inactive"}`
+                  : "Unavailable"}
+              </dd>
               <dt>Production policy</dt>
               <dd>
                 {status?.productionProtection
@@ -481,6 +1273,15 @@ function App() {
                   : "Read-only by design"}
               </dd>
             </dl>
+            <button disabled={running || busy} onClick={resetWorkspaceSettings}>
+              Reset saved proxy settings
+            </button>
+            <p className="muted">
+              Port, capture options, redaction paths, destination rules and the
+              selected authentication profile are saved only in this local
+              workspace. Ephemeral passwords and HTTPS inspection consent are
+              never persisted.
+            </p>
             <div className="settings-divider" />
             <h2>HTTPS inspection foundation</h2>
             <p>
@@ -519,8 +1320,79 @@ function App() {
                     browser or runtime that will use the proxy. This verifies
                     only that client and does not enable HTTPS inspection.
                   </p>
+                  <div className="client-profile-editor">
+                    <label htmlFor="tls-client-profile">Client profile</label>
+                    <div className="trust-check-actions">
+                      <select
+                        id="tls-client-profile"
+                        value={selectedClientId}
+                        disabled={
+                          running ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
+                        }
+                        onChange={(event) =>
+                          setSelectedClientId(event.target.value)
+                        }
+                      >
+                        <option value="">Choose a configured client</option>
+                        {clientProfiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>
+                            {profile.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        disabled={
+                          !selectedClient ||
+                          running ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
+                        }
+                        onClick={removeSelectedClient}
+                      >
+                        Remove profile
+                      </button>
+                    </div>
+                    <div className="trust-check-actions">
+                      <input
+                        value={newClientName}
+                        maxLength={80}
+                        disabled={
+                          running ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
+                        }
+                        aria-label="New client profile name"
+                        placeholder="Chrome development profile"
+                        onChange={(event) =>
+                          setNewClientName(event.target.value)
+                        }
+                      />
+                      <button
+                        disabled={
+                          !newClientName.trim() ||
+                          running ||
+                          trustCheck?.state === "waiting" ||
+                          trustCheckBusy
+                        }
+                        onClick={addClientProfile}
+                      >
+                        Add profile
+                      </button>
+                    </div>
+                    <p className="muted">
+                      The profile records your chosen browser or runtime; it
+                      does not identify a process automatically. A trust proof
+                      cannot be reused for a different profile.
+                    </p>
+                  </div>
                   {trustCheck?.state === "waiting" ? (
                     <>
+                      <p role="status">
+                        Waiting for{" "}
+                        {trustCheck.client?.name ?? "selected client"}.
+                      </p>
                       <code className="trust-check-url">{trustCheck.url}</code>
                       <p>
                         Expires at{" "}
@@ -550,7 +1422,8 @@ function App() {
                     <>
                       {trustCheck?.state === "verified" && (
                         <p role="status">
-                          Trust verified for this client
+                          Trust verified for{" "}
+                          {trustCheck.client?.name ?? "this client"}
                           {trustCheck.verifiedAt
                             ? ` at ${new Date(trustCheck.verifiedAt).toLocaleTimeString()}`
                             : ""}
@@ -570,7 +1443,7 @@ function App() {
                         <input
                           type="checkbox"
                           checked={trustCheckConsent}
-                          disabled={caBusy || trustCheckBusy}
+                          disabled={running || caBusy || trustCheckBusy}
                           onChange={(event) =>
                             setTrustCheckConsent(event.target.checked)
                           }
@@ -580,7 +1453,11 @@ function App() {
                       </label>
                       <button
                         disabled={
-                          caBusy || trustCheckBusy || !trustCheckConsent
+                          caBusy ||
+                          trustCheckBusy ||
+                          running ||
+                          !trustCheckConsent ||
+                          !selectedClient
                         }
                         onClick={() =>
                           void trustCheckCommand("start_tls_trust_check")

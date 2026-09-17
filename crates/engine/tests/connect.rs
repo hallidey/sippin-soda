@@ -1,4 +1,5 @@
-use sippin_soda_engine::{ProxyConfig, ProxyEngine};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use sippin_soda_engine::{ProxyClientAuth, ProxyConfig, ProxyEngine};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -51,6 +52,49 @@ async fn settled(engine: &ProxyEngine) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_connect_is_bound_to_the_configured_client_profile() {
+    const TOKEN: &str = "abcdef0123456789abcdef0123456789";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap().port();
+    let (engine, proxy) = start(ProxyConfig {
+        client_auth: Some(ProxyClientAuth::new("runtime-1", TOKEN).unwrap()),
+        ..Default::default()
+    })
+    .await;
+
+    let mut unauthenticated = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+    unauthenticated
+        .write_all(
+            format!("CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(headers(&mut unauthenticated)
+        .await
+        .starts_with("HTTP/1.1 407"));
+    assert!(timeout(Duration::from_millis(50), listener.accept())
+        .await
+        .is_err());
+
+    let credentials = BASE64.encode(format!("runtime-1:{TOKEN}"));
+    let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+    client
+        .write_all(
+            format!("CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic {credentials}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(headers(&mut client).await.starts_with("HTTP/1.1 200"));
+    let (server, _) = listener.accept().await.unwrap();
+    drop(client);
+    drop(server);
+    settled(&engine).await;
+    let capture = engine.stop().await.traffic.remove(0);
+    assert_eq!(capture.client_profile_id.as_deref(), Some("runtime-1"));
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 use crate::{authorize, Action, CaStatus, DestinationClass, IssuedLeaf, PolicyError};
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Serialize;
 use std::{
     sync::Arc,
@@ -20,9 +21,14 @@ pub enum TlsInterceptError {
     HandshakeTimeout,
     DownstreamHandshake,
     UpstreamVerification,
+    UnsupportedApplicationProtocol,
     Transport,
     LifetimeExceeded,
 }
+
+pub(crate) const HTTP1_ALPN: &[u8] = b"http/1.1";
+pub(crate) const HTTP2_ALPN: &[u8] = b"h2";
+pub(crate) const INSPECTION_ALPN: [&[u8]; 2] = [HTTP2_ALPN, HTTP1_ALPN];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsBridgeResult {
@@ -37,7 +43,50 @@ pub enum TlsReadinessState {
     MissingCa,
     ExpiredCa,
     ClientTrustUnverified,
+    ClientMismatch,
     Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsClientIdentity {
+    id: String,
+    name: String,
+}
+
+impl TlsClientIdentity {
+    pub fn new(id: &str, name: &str) -> Result<Self, String> {
+        let id = Self::validate_id(id)?;
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            return Err("Client profile names must contain 1-80 visible characters.".into());
+        }
+        Ok(Self {
+            id,
+            name: name.into(),
+        })
+    }
+
+    pub fn validate_id(id: &str) -> Result<String, String> {
+        let id = id.trim();
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("Client profile IDs must use 1-64 letters, numbers, '-' or '_'.".into());
+        }
+        Ok(id.into())
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,6 +95,7 @@ pub struct TlsInspectionReadiness {
     pub state: TlsReadinessState,
     pub can_inspect_development: bool,
     pub verified_host: Option<String>,
+    pub verified_client: Option<TlsClientIdentity>,
     pub proof_expires_at: Option<u64>,
 }
 
@@ -68,6 +118,7 @@ pub enum TlsTrustError {
 struct TlsClientTrustProof {
     issuer_fingerprint_sha256: String,
     verified_host: String,
+    client: TlsClientIdentity,
     expires_at: u64,
 }
 
@@ -89,6 +140,7 @@ impl TlsInspectionGate {
         &mut self,
         client: C,
         leaf: IssuedLeaf,
+        identity: TlsClientIdentity,
         handshake_timeout: Duration,
     ) -> Result<tokio_rustls::server::TlsStream<C>, TlsTrustError>
     where
@@ -98,16 +150,17 @@ impl TlsInspectionGate {
             return Err(TlsTrustError::InspectionDisabled);
         }
         self.trust_proof = None;
-        let (proof, stream) = client_trust_handshake(client, leaf, handshake_timeout).await?;
+        let (proof, stream) =
+            client_trust_handshake(client, leaf, identity, handshake_timeout).await?;
         self.trust_proof = Some(proof);
         Ok(stream)
     }
 
-    pub fn readiness(&self, ca: &CaStatus) -> TlsInspectionReadiness {
-        self.readiness_at(ca, unix_millis())
+    pub fn readiness(&self, ca: &CaStatus, client_id: &str) -> TlsInspectionReadiness {
+        self.readiness_at(ca, client_id, unix_millis())
     }
 
-    fn readiness_at(&self, ca: &CaStatus, now: u64) -> TlsInspectionReadiness {
+    fn readiness_at(&self, ca: &CaStatus, client_id: &str, now: u64) -> TlsInspectionReadiness {
         let state = if !self.opted_in {
             TlsReadinessState::Disabled
         } else if ca.state != "ready" || ca.fingerprint_sha256.is_none() || ca.expires_at.is_none()
@@ -120,6 +173,12 @@ impl TlsInspectionGate {
                 || proof.expires_at <= now
         }) {
             TlsReadinessState::ClientTrustUnverified
+        } else if self
+            .trust_proof
+            .as_ref()
+            .is_some_and(|proof| proof.client.id() != client_id)
+        {
+            TlsReadinessState::ClientMismatch
         } else {
             TlsReadinessState::Ready
         };
@@ -130,6 +189,7 @@ impl TlsInspectionGate {
             state,
             can_inspect_development: state == TlsReadinessState::Ready,
             verified_host: proof.map(|proof| proof.verified_host.clone()),
+            verified_client: proof.map(|proof| proof.client.clone()),
             proof_expires_at: proof.map(|proof| proof.expires_at),
         }
     }
@@ -137,9 +197,10 @@ impl TlsInspectionGate {
     pub fn authorize(
         &self,
         ca: &CaStatus,
+        client_id: &str,
         destination: DestinationClass,
     ) -> Result<(), TlsInspectionDenied> {
-        let readiness = self.readiness(ca);
+        let readiness = self.readiness(ca, client_id);
         if readiness.state != TlsReadinessState::Ready {
             return Err(TlsInspectionDenied::NotReady(readiness.state));
         }
@@ -159,10 +220,12 @@ fn unix_millis() -> u64 {
 
 /// Completes a real downstream TLS handshake. Success proves that this client
 /// accepted a leaf issued by the current CA; the proof is scoped to that CA,
-/// host and leaf lifetime and cannot be constructed by callers.
+/// host, selected client profile and leaf lifetime and cannot be constructed
+/// by callers.
 async fn client_trust_handshake<C>(
     client: C,
     leaf: IssuedLeaf,
+    identity: TlsClientIdentity,
     handshake_timeout: Duration,
 ) -> Result<(TlsClientTrustProof, tokio_rustls::server::TlsStream<C>), TlsTrustError>
 where
@@ -171,6 +234,7 @@ where
     let proof = TlsClientTrustProof {
         issuer_fingerprint_sha256: leaf.issuer_fingerprint_sha256.clone(),
         verified_host: leaf.host.clone(),
+        client: identity,
         expires_at: leaf.expires_at,
     };
     let server = ServerConfig::builder()
@@ -206,34 +270,58 @@ pub async fn bridge_verified_tls<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let upstream_name = ServerName::try_from(upstream_name.to_owned())
-        .map_err(|_| TlsInterceptError::InvalidUpstreamName)?;
-    let server = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(leaf.certificate_der)],
-            PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
-        )
-        .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
-    let client_config = ClientConfig::builder()
-        .with_root_certificates(upstream_roots)
-        .with_no_client_auth();
-    let downstream = TlsAcceptor::from(Arc::new(server)).accept(client);
-    let verified_upstream =
-        TlsConnector::from(Arc::new(client_config)).connect(upstream_name, upstream);
-    let (downstream, verified_upstream) = tokio::time::timeout(handshake_timeout, async {
-        let upstream = verified_upstream
-            .await
-            .map_err(|_| TlsInterceptError::UpstreamVerification)?;
-        let downstream = downstream
-            .await
-            .map_err(|_| TlsInterceptError::DownstreamHandshake)?;
-        Ok::<_, TlsInterceptError>((downstream, upstream))
-    })
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth(),
+    );
+    bridge_verified_tls_with_config(
+        client,
+        upstream,
+        upstream_name,
+        leaf,
+        client_config,
+        handshake_timeout,
+        lifetime,
+    )
     .await
-    .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
-    let (downstream_reader, downstream_writer) = tokio::io::split(downstream);
-    let (upstream_reader, upstream_writer) = tokio::io::split(verified_upstream);
+}
+
+pub(crate) fn platform_tls_client_config() -> Result<Arc<ClientConfig>, String> {
+    ClientConfig::builder()
+        .with_platform_verifier()
+        .map(|builder| {
+            let mut config = builder.with_no_client_auth();
+            config.alpn_protocols = INSPECTION_ALPN.iter().map(|value| value.to_vec()).collect();
+            Arc::new(config)
+        })
+        .map_err(|_| "Cannot initialize platform TLS certificate verification.".into())
+}
+
+pub(crate) async fn bridge_verified_tls_with_config<C>(
+    client: C,
+    upstream: tokio::net::TcpStream,
+    upstream_name: &str,
+    leaf: IssuedLeaf,
+    client_config: Arc<ClientConfig>,
+    handshake_timeout: Duration,
+    lifetime: Duration,
+) -> Result<TlsBridgeResult, TlsInterceptError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let established = establish_verified_tls_with_config(
+        client,
+        upstream,
+        upstream_name,
+        leaf,
+        client_config,
+        handshake_timeout,
+        None,
+    )
+    .await?;
+    let (downstream_reader, downstream_writer) = tokio::io::split(established.downstream);
+    let (upstream_reader, upstream_writer) = tokio::io::split(established.upstream);
     let transfer = async {
         tokio::try_join!(
             copy_with_flush(downstream_reader, upstream_writer),
@@ -248,6 +336,67 @@ where
     Ok(TlsBridgeResult {
         client_to_upstream_bytes,
         upstream_to_client_bytes,
+    })
+}
+
+pub(crate) struct VerifiedTls<C> {
+    pub(crate) downstream: tokio_rustls::server::TlsStream<C>,
+    pub(crate) upstream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    pub(crate) protocol: Option<Vec<u8>>,
+}
+
+pub(crate) async fn establish_verified_tls_with_config<C>(
+    client: C,
+    upstream: tokio::net::TcpStream,
+    upstream_name: &str,
+    leaf: IssuedLeaf,
+    client_config: Arc<ClientConfig>,
+    handshake_timeout: Duration,
+    allowed_alpn: Option<&[&[u8]]>,
+) -> Result<VerifiedTls<C>, TlsInterceptError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let upstream_name = ServerName::try_from(upstream_name.to_owned())
+        .map_err(|_| TlsInterceptError::InvalidUpstreamName)?;
+    let mut server = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(leaf.certificate_der)],
+            PrivatePkcs8KeyDer::from(leaf.private_key_der.to_vec()).into(),
+        )
+        .map_err(|_| TlsInterceptError::InvalidLeafMaterial)?;
+    let verified_upstream = TlsConnector::from(client_config).connect(upstream_name, upstream);
+    let (downstream, upstream) = tokio::time::timeout(handshake_timeout, async {
+        let upstream = verified_upstream
+            .await
+            .map_err(|_| TlsInterceptError::UpstreamVerification)?;
+        let protocol = upstream.get_ref().1.alpn_protocol();
+        if allowed_alpn
+            .is_some_and(|allowed| !protocol.is_some_and(|protocol| allowed.contains(&protocol)))
+        {
+            return Err(TlsInterceptError::UnsupportedApplicationProtocol);
+        }
+        if let Some(protocol) = protocol {
+            server.alpn_protocols = vec![protocol.to_vec()];
+        }
+        let downstream = TlsAcceptor::from(Arc::new(server))
+            .accept(client)
+            .await
+            .map_err(|_| TlsInterceptError::DownstreamHandshake)?;
+        Ok::<_, TlsInterceptError>((downstream, upstream))
+    })
+    .await
+    .map_err(|_| TlsInterceptError::HandshakeTimeout)??;
+    if allowed_alpn.is_some_and(|_| {
+        downstream.get_ref().1.alpn_protocol() != upstream.get_ref().1.alpn_protocol()
+    }) {
+        return Err(TlsInterceptError::UnsupportedApplicationProtocol);
+    }
+    Ok(VerifiedTls {
+        protocol: upstream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec),
+        downstream,
+        upstream,
     })
 }
 
@@ -317,53 +466,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_application_protocol_rejects_missing_upstream_alpn() {
+        let (upstream_identity, upstream_server) = upstream_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(Arc::new(upstream_server))
+                .accept(socket)
+                .await
+                .unwrap()
+        });
+        let upstream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut upstream_roots = RootCertStore::empty();
+        upstream_roots
+            .add(upstream_identity.cert.der().clone())
+            .unwrap();
+        let mut upstream_client = ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth();
+        upstream_client.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+
+        let (ca_pem, leaf, _) = CaManager::ephemeral_leaf_for_test("client.dev.test");
+        let (server_side, client_side) = tokio::io::duplex(16 * 1024);
+        let established = establish_verified_tls_with_config(
+            server_side,
+            upstream,
+            "upstream.dev.test",
+            leaf,
+            Arc::new(upstream_client),
+            Duration::from_secs(2),
+            Some(&[HTTP1_ALPN]),
+        );
+        let mut downstream_roots = RootCertStore::empty();
+        downstream_roots
+            .add(
+                rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut downstream_client = ClientConfig::builder()
+            .with_root_certificates(downstream_roots)
+            .with_no_client_auth();
+        downstream_client.alpn_protocols = vec![HTTP1_ALPN.to_vec()];
+        let client = TlsConnector::from(Arc::new(downstream_client)).connect(
+            ServerName::try_from("client.dev.test").unwrap(),
+            client_side,
+        );
+        let (established, client) = tokio::join!(established, client);
+        assert!(client.is_err());
+        assert!(matches!(
+            established,
+            Err(TlsInterceptError::UnsupportedApplicationProtocol)
+        ));
+        let upstream = upstream_task.await.unwrap();
+        assert_eq!(upstream.get_ref().1.alpn_protocol(), None);
+    }
+
+    #[test]
+    fn client_identity_is_canonical_and_bounded() {
+        let identity = TlsClientIdentity::new(" browser-1 ", " Development browser ").unwrap();
+        assert_eq!(identity.id(), "browser-1");
+        assert_eq!(identity.name(), "Development browser");
+        assert!(TlsClientIdentity::new("browser/1", "Browser").is_err());
+        assert!(TlsClientIdentity::new("browser-1", "\n").is_err());
+        assert!(TlsClientIdentity::new("browser-1", &"é".repeat(81)).is_err());
+    }
+
+    #[tokio::test]
     async fn readiness_requires_opt_in_current_ca_and_real_client_trust() {
         let (ca_pem, leaf, status) = CaManager::ephemeral_leaf_for_test("client.dev.test");
+        let identity = TlsClientIdentity::new("browser-1", "Development browser").unwrap();
         let (server_side, client_side) = tokio::io::duplex(16 * 1024);
         let mut gate = TlsInspectionGate::default();
-        assert_eq!(gate.readiness(&status).state, TlsReadinessState::Disabled);
+        assert_eq!(
+            gate.readiness(&status, identity.id()).state,
+            TlsReadinessState::Disabled
+        );
         gate.set_opt_in(true);
         assert_eq!(
-            gate.readiness(&status).state,
+            gate.readiness(&status, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
-        let verification = gate.verify_client_trust(server_side, leaf, Duration::from_secs(2));
+        let verification =
+            gate.verify_client_trust(server_side, leaf, identity.clone(), Duration::from_secs(2));
         let client_connection = downstream_client(client_side, ca_pem.as_bytes());
         let (verification, client) = tokio::join!(verification, client_connection);
         drop(verification.unwrap());
         drop(client.unwrap());
-        let readiness = gate.readiness(&status);
+        let readiness = gate.readiness(&status, identity.id());
         assert_eq!(readiness.state, TlsReadinessState::Ready);
         assert!(readiness.can_inspect_development);
         assert_eq!(readiness.verified_host.as_deref(), Some("client.dev.test"));
+        assert_eq!(readiness.verified_client.as_ref(), Some(&identity));
         assert_eq!(
-            gate.readiness_at(&status, readiness.proof_expires_at.unwrap())
+            gate.readiness(&status, "different-client").state,
+            TlsReadinessState::ClientMismatch
+        );
+        assert_eq!(
+            gate.readiness_at(&status, identity.id(), readiness.proof_expires_at.unwrap())
                 .state,
             TlsReadinessState::ClientTrustUnverified
         );
         assert_eq!(
-            gate.authorize(&status, DestinationClass::Development),
+            gate.authorize(&status, identity.id(), DestinationClass::Development),
             Ok(())
         );
         assert_eq!(
-            gate.authorize(&status, DestinationClass::Production),
+            gate.authorize(&status, identity.id(), DestinationClass::Production),
             Err(TlsInspectionDenied::ProductionReadOnly)
         );
         assert_eq!(
-            gate.authorize(&status, DestinationClass::Unknown),
+            gate.authorize(&status, identity.id(), DestinationClass::Unknown),
             Err(TlsInspectionDenied::DestinationUnclassified)
         );
         let mut rotated = status.clone();
         rotated.fingerprint_sha256 = Some("rotated-ca".into());
         assert_eq!(
-            gate.readiness(&rotated).state,
+            gate.readiness(&rotated, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
 
         gate.set_opt_in(false);
         gate.set_opt_in(true);
         assert_eq!(
-            gate.readiness(&status).state,
+            gate.readiness(&status, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
     }
@@ -371,10 +600,12 @@ mod tests {
     #[tokio::test]
     async fn readiness_rejects_changed_or_expired_ca_and_failed_trust_handshake() {
         let (_ca_pem, leaf, mut status) = CaManager::ephemeral_leaf_for_test("client.dev.test");
+        let identity = TlsClientIdentity::new("runtime-1", "Test runtime").unwrap();
         let (server_side, client_side) = tokio::io::duplex(16 * 1024);
         let mut gate = TlsInspectionGate::default();
         gate.set_opt_in(true);
-        let verification = gate.verify_client_trust(server_side, leaf, Duration::from_secs(2));
+        let verification =
+            gate.verify_client_trust(server_side, leaf, identity.clone(), Duration::from_secs(2));
         let untrusted = TlsConnector::from(Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(RootCertStore::empty())
@@ -391,17 +622,17 @@ mod tests {
             Err(TlsTrustError::ClientRejectedCertificate)
         ));
         assert_eq!(
-            gate.readiness(&status).state,
+            gate.readiness(&status, identity.id()).state,
             TlsReadinessState::ClientTrustUnverified
         );
         status.expires_at = Some(1);
         assert_eq!(
-            gate.readiness_at(&status, 2).state,
+            gate.readiness_at(&status, identity.id(), 2).state,
             TlsReadinessState::ExpiredCa
         );
         status.state = "absent".into();
         assert_eq!(
-            gate.readiness_at(&status, 2).state,
+            gate.readiness_at(&status, identity.id(), 2).state,
             TlsReadinessState::MissingCa
         );
 
@@ -410,7 +641,7 @@ mod tests {
         let mut disabled = TlsInspectionGate::default();
         assert!(matches!(
             disabled
-                .verify_client_trust(server_side, leaf, Duration::from_secs(2))
+                .verify_client_trust(server_side, leaf, identity, Duration::from_secs(2))
                 .await,
             Err(TlsTrustError::InspectionDisabled)
         ));
@@ -527,6 +758,7 @@ mod tests {
         payload_bytes: usize,
         samples: usize,
         concurrency: usize,
+        http2_streams: usize,
     }
 
     struct BenchmarkModeResult {
@@ -548,6 +780,7 @@ mod tests {
             payload_bytes: benchmark_setting("SIPPIN_BENCH_PAYLOAD_MIB", 1, 1, 64) * 1024 * 1024,
             samples: benchmark_setting("SIPPIN_BENCH_SAMPLES", 20, 3, 500),
             concurrency: benchmark_setting("SIPPIN_BENCH_CONCURRENCY", 4, 1, 64),
+            http2_streams: benchmark_setting("SIPPIN_BENCH_H2_STREAMS", 8, 1, 64),
         }
     }
 
@@ -680,6 +913,86 @@ mod tests {
         elapsed
     }
 
+    async fn http2_tls_sample(
+        payload: Arc<Vec<u8>>,
+        identity: BenchmarkIdentity,
+        streams: usize,
+    ) -> Duration {
+        use http_body_util::{BodyExt, Full};
+        use hyper::{body::Bytes, service::service_fn, Request, Response};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.certificate.clone()],
+                PrivatePkcs8KeyDer::from(identity.private_key.clone()).into(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let tls = TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            let service = service_fn(|request: Request<hyper::body::Incoming>| async move {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                Ok::<_, std::convert::Infallible>(Response::new(Full::new(body)))
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await;
+        });
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.certificate).unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![HTTP2_ALPN.to_vec()];
+        let started = std::time::Instant::now();
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let tls = TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("upstream.dev.test").unwrap(), socket)
+            .await
+            .unwrap();
+        let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        let connection = tokio::spawn(connection);
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..streams {
+            let mut sender = sender.clone();
+            let payload = payload.clone();
+            requests.spawn(async move {
+                let request = Request::post("https://upstream.dev.test/benchmark")
+                    .body(Full::new(Bytes::copy_from_slice(&payload)))
+                    .unwrap();
+                sender
+                    .send_request(request)
+                    .await
+                    .unwrap()
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert_eq!(result.unwrap().as_ref(), payload.as_slice());
+        }
+        let elapsed = started.elapsed();
+        connection.abort();
+        server.abort();
+        elapsed
+    }
+
     async fn measure_mode<F, Fut>(config: BenchmarkConfig, sample: F) -> BenchmarkModeResult
     where
         F: Fn() -> Fut + Clone + Send + 'static,
@@ -748,8 +1061,12 @@ mod tests {
     fn benchmark_report(
         config: BenchmarkConfig,
         result: &BenchmarkModeResult,
+        payload_multiplier: usize,
     ) -> serde_json::Value {
-        let transferred = (config.payload_bytes as f64) * (config.samples as f64) * 2.0;
+        let transferred = (config.payload_bytes as f64)
+            * (config.samples as f64)
+            * (payload_multiplier as f64)
+            * 2.0;
         serde_json::json!({
             "wallMs": result.wall_time.as_secs_f64() * 1000.0,
             "p50Micros": percentile(&result.samples, 50),
@@ -779,6 +1096,14 @@ mod tests {
             async move { tls_sample(payload, upstream, downstream).await }
         })
         .await;
+        let http2_identity = benchmark_identity("upstream.dev.test");
+        let http2_payload = Arc::new(vec![0x5a; config.payload_bytes]);
+        let http2 = measure_mode(config, move || {
+            let payload = http2_payload.clone();
+            let identity = http2_identity.clone();
+            async move { http2_tls_sample(payload, identity, config.http2_streams).await }
+        })
+        .await;
         let mut system = sysinfo::System::new_all();
         system.refresh_cpu_all();
         let report = serde_json::json!({
@@ -796,9 +1121,11 @@ mod tests {
                 "concurrency": config.concurrency,
                 "tlsIncludesHandshake": true,
                 "connectionTeardownIncluded": false,
+                "http2StreamsPerConnection": config.http2_streams,
             },
-            "passThrough": benchmark_report(config, &pass_through),
-            "verifiedTlsBridge": benchmark_report(config, &tls),
+            "passThrough": benchmark_report(config, &pass_through, 1),
+            "verifiedTlsBridge": benchmark_report(config, &tls, 1),
+            "http2TlsMultiplexBaseline": benchmark_report(config, &http2, config.http2_streams),
             "tlsP50OverheadPercent": (percentile(&tls.samples, 50) / percentile(&pass_through.samples, 50) - 1.0) * 100.0,
         });
         println!("SIPPIN_TLS_BENCHMARK={report}");

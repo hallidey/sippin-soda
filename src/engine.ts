@@ -4,10 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 
 export type Capture = {
   id: number;
-  kind: "http" | "tunnel";
+  kind: "http" | "https" | "tunnel" | "tls";
   method: string;
   target: string;
   destinationClass: "development" | "production" | "unknown";
+  clientProfileId: string | null;
   startedAt: number;
   status: number | null;
   phase: "pending" | "complete" | "error";
@@ -17,9 +18,15 @@ export type Capture = {
   requestHeaders: [string, string][];
   responseHeaders: [string, string][];
   error: string | null;
-  requestBodyState: "disabled" | "empty" | "recording" | "complete" | "unavailable";
+  requestBodyState:
+    "disabled" | "empty" | "recording" | "complete" | "unavailable";
   requestBodyError: string | null;
   responseBodyError: string | null;
+  breakpointState: "none" | "waiting" | "continued" | "modified" | "timed_out";
+  originalStatus: number | null;
+  replayOf: number | null;
+  responseRuleId: string | null;
+  responseRuleName: string | null;
 };
 
 export type Snapshot = {
@@ -32,6 +39,7 @@ export type Snapshot = {
     productionProtection: boolean;
     evictedCaptures: number;
     rejectedConnections: number;
+    clientProfileId: string | null;
   };
   traffic: Capture[];
 };
@@ -84,10 +92,12 @@ export function useEngine() {
     setError("");
     try {
       accept(await invoke<Snapshot>(name, args));
+      return true;
     } catch (cause) {
       setError(
         typeof cause === "string" ? cause : "The engine command failed.",
       );
+      return false;
     } finally {
       setBusy(false);
     }

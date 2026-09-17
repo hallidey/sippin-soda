@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sippin_soda_engine::{
-    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus, ProxyConfig,
-    ProxyEngine, SearchStep, Snapshot, TlsTrustCheckManager, TlsTrustCheckStatus,
+    BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus,
+    ProxyClientAuth, ProxyConfig, ProxyEngine, ProxyTlsInterception, ResponseRuleConfig,
+    SearchStep, Snapshot, TlsClientIdentity, TlsInspectionPreflight, TlsTrustCheckManager,
+    TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -16,6 +18,23 @@ struct BodyExportResult {
     bytes: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartProxyOptions {
+    port: u16,
+    capture_bodies: bool,
+    disk_budget_gib: u32,
+    request_redaction_paths: Vec<String>,
+    development_hosts: Vec<String>,
+    production_hosts: Vec<String>,
+    client_profile_id: Option<String>,
+    client_token: Option<String>,
+    enable_https_inspection: bool,
+    break_on_responses: bool,
+    #[serde(default)]
+    response_rules: Vec<ResponseRuleConfig>,
+}
+
 #[tauri::command]
 fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
     engine.snapshot()
@@ -24,27 +43,69 @@ fn engine_snapshot(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
 #[tauri::command]
 async fn start_proxy(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
-    port: u16,
-    capture_bodies: bool,
-    disk_budget_gib: u32,
-    request_redaction_paths: Vec<String>,
-    development_hosts: Vec<String>,
-    production_hosts: Vec<String>,
+    ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+    options: StartProxyOptions,
 ) -> Result<Snapshot, String> {
-    if !(1..=1024).contains(&disk_budget_gib) {
+    if !(1..=1024).contains(&options.disk_budget_gib) {
         return Err("Disk budget must be between 1 and 1024 GiB.".into());
     }
+    let client_auth = match (options.client_profile_id, options.client_token) {
+        (None, None) => None,
+        (Some(profile_id), Some(token)) => Some(ProxyClientAuth::new(&profile_id, &token)?),
+        _ => return Err("Proxy client profile and token must be configured together.".into()),
+    };
+    let tls_interception = if options.enable_https_inspection {
+        let profile_id = client_auth
+            .as_ref()
+            .map(ProxyClientAuth::profile_id)
+            .ok_or("HTTPS inspection requires client profile authentication.")?;
+        let ca_worker = ca.inner().clone();
+        let ca_status = tauri::async_runtime::spawn_blocking(move || ca_worker.status())
+            .await
+            .map_err(|_| "HTTPS inspection CA worker failed.".to_string())??;
+        if !trust_check
+            .readiness(&ca_status, profile_id)
+            .is_some_and(|readiness| readiness.can_inspect_development)
+        {
+            return Err(
+                "Verify CA trust with this client profile before enabling HTTPS inspection.".into(),
+            );
+        }
+        Some(ProxyTlsInterception::platform(
+            ca.inner().clone(),
+            trust_check.inner().clone(),
+            profile_id,
+        )?)
+    } else {
+        None
+    };
     engine
         .start(ProxyConfig {
-            port,
-            capture_bodies,
-            body_disk_budget: u64::from(disk_budget_gib) * 1024 * 1024 * 1024,
-            request_redaction_paths,
-            development_hosts,
-            production_hosts,
+            port: options.port,
+            capture_bodies: options.capture_bodies,
+            body_disk_budget: u64::from(options.disk_budget_gib) * 1024 * 1024 * 1024,
+            request_redaction_paths: options.request_redaction_paths,
+            development_hosts: options.development_hosts,
+            production_hosts: options.production_hosts,
+            client_auth,
+            tls_interception,
+            break_on_responses: options.break_on_responses,
+            response_rules: options.response_rules,
             ..Default::default()
         })
         .await
+}
+
+#[tauri::command]
+fn resolve_response_breakpoint(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+    status: Option<u16>,
+    body: Option<String>,
+    content_type: Option<String>,
+) -> Result<Snapshot, String> {
+    engine.resolve_response_breakpoint(id, status, body, content_type)
 }
 
 #[tauri::command]
@@ -140,6 +201,14 @@ fn clear_traffic(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
 }
 
 #[tauri::command]
+async fn replay_capture(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+) -> Result<Snapshot, String> {
+    engine.replay(id).await
+}
+
+#[tauri::command]
 fn body_export_preview(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
     id: u64,
@@ -192,10 +261,12 @@ async fn ca_status(ca: tauri::State<'_, Arc<CaManager>>) -> Result<CaStatus, Str
 
 #[tauri::command]
 async fn generate_local_ca(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     consent: bool,
 ) -> Result<CaStatus, String> {
+    engine.stop().await;
     trust_check.cancel().await;
     let ca = ca.inner().clone();
     tauri::async_runtime::spawn_blocking(move || ca.generate(consent))
@@ -205,10 +276,12 @@ async fn generate_local_ca(
 
 #[tauri::command]
 async fn remove_local_ca(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
     confirmed: bool,
 ) -> Result<CaStatus, String> {
+    engine.stop().await;
     trust_check.cancel().await;
     let ca = ca.inner().clone();
     tauri::async_runtime::spawn_blocking(move || ca.remove(confirmed))
@@ -251,17 +324,36 @@ fn tls_trust_check_status(
 }
 
 #[tauri::command]
+async fn tls_inspection_preflight(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    ca: tauri::State<'_, Arc<CaManager>>,
+    trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+) -> Result<TlsInspectionPreflight, String> {
+    let proxy_status = engine.snapshot().status;
+    let ca = ca.inner().clone();
+    let ca_status = tauri::async_runtime::spawn_blocking(move || ca.status())
+        .await
+        .map_err(|_| "TLS inspection preflight worker failed.".to_string())??;
+    Ok(trust_check.preflight(&ca_status, &proxy_status))
+}
+
+#[tauri::command]
 async fn start_tls_trust_check(
     ca: tauri::State<'_, Arc<CaManager>>,
     trust_check: tauri::State<'_, Arc<TlsTrustCheckManager>>,
+    client_id: String,
+    client_name: String,
 ) -> Result<TlsTrustCheckStatus, String> {
+    let client = TlsClientIdentity::new(&client_id, &client_name)?;
     let ca = ca.inner().clone();
     let leaf = tauri::async_runtime::spawn_blocking(move || {
         ca.issue_leaf("localhost", DestinationClass::Development)
     })
     .await
     .map_err(|_| "TLS trust-check certificate worker failed.".to_string())??;
-    trust_check.start(leaf, Duration::from_secs(60)).await
+    trust_check
+        .start(leaf, client, Duration::from_secs(60))
+        .await
 }
 
 #[tauri::command]
@@ -298,6 +390,7 @@ fn main() {
             start_proxy,
             stop_proxy,
             clear_traffic,
+            replay_capture,
             request_body_page,
             search_request_body,
             request_json_view,
@@ -309,12 +402,14 @@ fn main() {
             remove_local_ca,
             export_local_ca,
             tls_trust_check_status,
+            tls_inspection_preflight,
             start_tls_trust_check,
             cancel_tls_trust_check,
             response_body_page,
             search_response_body,
             response_json_view,
-            response_json_page
+            response_json_page,
+            resolve_response_breakpoint
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Sippin Soda desktop")
