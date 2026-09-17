@@ -197,6 +197,14 @@ fn clear_traffic(engine: tauri::State<'_, Arc<ProxyEngine>>) -> Snapshot {
 }
 
 #[tauri::command]
+async fn replay_capture(
+    engine: tauri::State<'_, Arc<ProxyEngine>>,
+    id: u64,
+) -> Result<Snapshot, String> {
+    engine.replay(id).await
+}
+
+#[tauri::command]
 fn body_export_preview(
     engine: tauri::State<'_, Arc<ProxyEngine>>,
     id: u64,
@@ -378,6 +386,7 @@ fn main() {
             start_proxy,
             stop_proxy,
             clear_traffic,
+            replay_capture,
             request_body_page,
             search_request_body,
             request_json_view,

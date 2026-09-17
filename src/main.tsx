@@ -711,6 +711,7 @@ function App() {
               busy={busy}
               proxyCredential={proxyCredential}
               clear={() => void command("clear_traffic")}
+              replay={(id) => void command("replay_capture", { id })}
               resolveBreakpoint={(
                 id,
                 status,

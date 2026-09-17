@@ -23,6 +23,7 @@ export function Traffic({
   busy,
   proxyCredential,
   clear,
+  replay,
   resolveBreakpoint,
 }: {
   snapshot: Snapshot | null;
@@ -30,6 +31,7 @@ export function Traffic({
   busy: boolean;
   proxyCredential: { profileId: string; token: string } | null;
   clear: () => void;
+  replay: (id: number) => void;
   resolveBreakpoint: (
     id: number,
     status: number | null,
@@ -46,6 +48,12 @@ export function Traffic({
   const [replacementBody, setReplacementBody] = useState('{\n  "ok": true\n}');
   const traffic = snapshot?.traffic ?? [];
   const selected = traffic.find((capture) => capture.id === selectedId);
+  const canReplay =
+    selected?.destinationClass === "development" &&
+    selected.kind === "http" &&
+    (selected.method === "GET" || selected.method === "HEAD") &&
+    selected.requestBytes === 0 &&
+    selected.phase === "complete";
   const filtered = traffic.filter((capture) =>
     `${capture.method} ${capture.target} ${capture.status ?? ""}`
       .toLowerCase()
@@ -199,6 +207,26 @@ export function Traffic({
             {selected.clientProfileId && (
               <p>Authenticated client profile: {selected.clientProfileId}</p>
             )}
+            {selected.replayOf && (
+              <p>Replay of capture #{selected.replayOf}.</p>
+            )}
+            <div className="capture-actions">
+              <button
+                onClick={() => replay(selected.id)}
+                disabled={!desktop || busy || !canReplay}
+                title={
+                  canReplay
+                    ? "Replay this request to the same Development URL"
+                    : "Replay currently supports completed, bodyless HTTP GET/HEAD captures in Development"
+                }
+              >
+                Replay
+              </button>
+              <span>
+                Same Development URL; Authorization, cookies and API keys are
+                excluded.
+              </span>
+            </div>
             {selected.kind === "tunnel" && (
               <p className="capture-notice">
                 Opaque CONNECT tunnel. Status 200 means the tunnel opened; the

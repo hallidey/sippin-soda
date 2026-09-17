@@ -3825,6 +3825,7 @@ version = "0.1.0"
 dependencies = [
  "async-compression",
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "http-body-util",
  "hyper",
  "hyper-util",

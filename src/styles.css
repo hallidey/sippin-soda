@@ -696,6 +696,16 @@ input:focus-visible {
 .capture-notice {
   margin: 0 32px 10px;
 }
+.capture-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 32px 14px;
+}
+.capture-actions span {
+  color: var(--muted);
+  font-size: 12px;
+}
 .breakpoint-replacement {
   display: grid;
   gap: 10px;

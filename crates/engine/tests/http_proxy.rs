@@ -56,6 +56,117 @@ async fn start() -> (ProxyEngine, u16) {
     (engine, port)
 }
 
+async fn replay_fixture() -> (u16, oneshot::Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sent, received) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            loop {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+        let _ = sent.send(requests);
+    });
+    (port, received)
+}
+
+#[tokio::test]
+async fn replays_bodyless_development_get_to_same_url_without_credentials() {
+    let (upstream, received) = replay_fixture().await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            client_auth: Some(
+                ProxyClientAuth::new("desktop", "replay-secret-0123456789abcdefgh").unwrap(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let port = snapshot.status.listen_address.port();
+    let credential = BASE64.encode("desktop:replay-secret-0123456789abcdefgh");
+    let reply = send(
+        port,
+        format!(
+            "GET http://127.0.0.1:{upstream}/items?token=original HTTP/1.1\r\nHost: wrong.invalid\r\nProxy-Authorization: Basic {credential}\r\nAuthorization: Bearer secret\r\nCookie: session=secret\r\nX-Api-Key: secret\r\nAccept: application/json\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 200"));
+    let origin = engine.snapshot().traffic[0].clone();
+    let snapshot = engine.replay(origin.id).await.unwrap();
+    assert_eq!(snapshot.traffic.len(), 2);
+    assert_eq!(snapshot.traffic[0].replay_of, Some(origin.id));
+    assert_eq!(snapshot.traffic[0].status, Some(200));
+    assert_eq!(
+        snapshot.traffic[0].destination_class,
+        origin.destination_class
+    );
+    assert_eq!(
+        snapshot.traffic[0].client_profile_id.as_deref(),
+        Some("desktop")
+    );
+    let requests = received.await.unwrap();
+    assert!(requests[1].starts_with("GET /items?token=original HTTP/1.1\r\n"));
+    let replay = requests[1].to_ascii_lowercase();
+    assert!(replay.contains("accept: application/json"));
+    assert!(!replay.contains("authorization:"));
+    assert!(!replay.contains("cookie:"));
+    assert!(!replay.contains("x-api-key:"));
+    assert!(!replay.contains("x-sippin-internal-replay"));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn replay_fails_closed_for_production_and_unsupported_requests() {
+    let (upstream, _) = fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            production_hosts: vec!["127.0.0.1".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 204"));
+    let capture = engine.snapshot().traffic[0].clone();
+    assert!(engine.replay(capture.id).await.is_err());
+    engine.stop().await;
+
+    let (upstream, _) = fixture(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO).await;
+    let (engine, port) = start().await;
+    let reply = send(
+        port,
+        format!("POST http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 204"));
+    let capture = engine.snapshot().traffic[0].clone();
+    assert!(engine.replay(capture.id).await.is_err());
+    engine.stop().await;
+}
+
 #[tokio::test]
 async fn development_response_breakpoint_can_override_status_once() {
     let (upstream, _) = fixture(

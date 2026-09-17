@@ -3,7 +3,10 @@ use crate::{
     DestinationClass, EnginePhase, EngineStatus, IssuedLeaf, TlsClientIdentity, TlsInterceptError,
     TlsTrustCheckManager, HTTP2_ALPN, INSPECTION_ALPN,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 mod bodies;
 mod tunnel;
 pub use bodies::{BodyPage, JsonStatus, SearchStep};
@@ -33,7 +36,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::{JoinHandle, JoinSet},
@@ -43,6 +46,7 @@ use tokio_rustls::rustls::ClientConfig;
 use tunnel::Tunnel;
 
 type WireBody = BoxBody<Bytes, hyper::Error>;
+const INTERNAL_REPLAY_HEADER: &str = "x-sippin-internal-replay";
 
 enum UpstreamSender {
     Http1(hyper::client::conn::http1::SendRequest<RequestBody>),
@@ -265,6 +269,7 @@ pub struct Capture {
     pub response_body_error: Option<String>,
     pub breakpoint_state: String,
     pub original_status: Option<u16>,
+    pub replay_of: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -435,6 +440,20 @@ struct State {
     destination_classifier: DestinationClassifier,
     break_on_responses: bool,
     breakpoints: HashMap<u64, oneshot::Sender<BreakpointDecision>>,
+    replay_templates: HashMap<u64, ReplayTemplate>,
+    replay_tokens: HashMap<String, ReplayAuthorization>,
+}
+
+#[derive(Clone)]
+struct ReplayTemplate {
+    method: Method,
+    uri: hyper::Uri,
+    headers: HeaderMap,
+}
+
+struct ReplayAuthorization {
+    origin_id: u64,
+    client_profile_id: Option<String>,
 }
 
 struct BreakpointDecision {
@@ -475,6 +494,8 @@ impl Default for ProxyEngine {
                 destination_classifier: DestinationClassifier::default(),
                 break_on_responses: false,
                 breakpoints: HashMap::new(),
+                replay_templates: HashMap::new(),
+                replay_tokens: HashMap::new(),
             })),
             running: tokio::sync::Mutex::new(None),
         }
@@ -482,6 +503,56 @@ impl Default for ProxyEngine {
 }
 
 impl ProxyEngine {
+    pub async fn replay(&self, id: u64) -> Result<Snapshot, String> {
+        let (template, address, client_profile_id) = {
+            let state = self.shared.lock().unwrap();
+            if state.status.phase != EnginePhase::Running {
+                return Err("Start the proxy before replaying a request.".into());
+            }
+            let capture = state
+                .traffic
+                .iter()
+                .find(|capture| capture.id == id)
+                .ok_or("Capture cleared or evicted.")?;
+            authorize(capture.destination_class, Action::Replay)
+                .map_err(|_| "Replay is allowed only for Development destinations.")?;
+            if capture.phase != "complete" {
+                return Err("Only a completed request can be replayed.".into());
+            }
+            let template = state
+                .replay_templates
+                .get(&id)
+                .cloned()
+                .ok_or("This capture cannot be replayed; only bodyless HTTP GET and HEAD requests are currently supported.")?;
+            let current_class = state
+                .destination_classifier
+                .classify(template.uri.host().unwrap_or(""));
+            authorize(current_class, Action::Replay).map_err(|_| {
+                "The current destination rules no longer allow replay for this target."
+            })?;
+            (
+                template,
+                state.status.listen_address,
+                capture.client_profile_id.clone(),
+            )
+        };
+        let mut random = [0_u8; 24];
+        getrandom::fill(&mut random)
+            .map_err(|_| "Cannot authorize the internal replay request.")?;
+        let token = URL_SAFE_NO_PAD.encode(random);
+        self.shared.lock().unwrap().replay_tokens.insert(
+            token.clone(),
+            ReplayAuthorization {
+                origin_id: id,
+                client_profile_id,
+            },
+        );
+        let result = replay_through_proxy(address, &token, &template).await;
+        self.shared.lock().unwrap().replay_tokens.remove(&token);
+        result?;
+        Ok(self.snapshot())
+    }
+
     pub fn resolve_response_breakpoint(
         &self,
         id: u64,
@@ -757,6 +828,7 @@ impl ProxyEngine {
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
                     state.breakpoints.remove(&capture.id);
+                    state.replay_templates.remove(&capture.id);
                     state.request_bodies.remove(capture.id);
                     state.response_bodies.remove(capture.id);
                 }
@@ -836,6 +908,8 @@ impl ProxyEngine {
     pub fn clear(&self) -> Snapshot {
         let mut state = self.shared.lock().unwrap();
         state.breakpoints.clear();
+        state.replay_templates.clear();
+        state.replay_tokens.clear();
         state.traffic.clear();
         state.request_bodies.clear();
         state.response_bodies.clear();
@@ -1136,7 +1210,7 @@ fn proxy_authentication_required() -> Response<WireBody> {
 }
 
 async fn handle(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     shared: Shared,
     proxy: SocketAddr,
     deadline: Duration,
@@ -1144,10 +1218,16 @@ async fn handle(
     client_auth: Option<ProxyClientAuth>,
     tls_interception: Option<ProxyTlsInterception>,
 ) -> Result<Response<WireBody>, Infallible> {
-    let client_profile_id = match client_auth {
-        Some(auth) if auth.accepts(request.headers()) => Some(auth.profile_id().to_owned()),
-        Some(_) => return Ok(proxy_authentication_required()),
-        None => None,
+    let replay = request
+        .headers_mut()
+        .remove(INTERNAL_REPLAY_HEADER)
+        .and_then(|value| value.to_str().ok().map(str::to_owned))
+        .and_then(|token| shared.lock().unwrap().replay_tokens.remove(&token));
+    let client_profile_id = match (&replay, client_auth) {
+        (Some(replay), _) => replay.client_profile_id.clone(),
+        (None, Some(auth)) if auth.accepts(request.headers()) => Some(auth.profile_id().to_owned()),
+        (None, Some(_)) => return Ok(proxy_authentication_required()),
+        (None, None) => None,
     };
     let destination_class = {
         let state = shared.lock().unwrap();
@@ -1155,11 +1235,18 @@ async fn handle(
             .destination_classifier
             .classify(request.uri().host().unwrap_or(""))
     };
+    if replay.is_some() && authorize(destination_class, Action::Replay).is_err() {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            "Replay is allowed only for Development destinations.",
+        ));
+    }
     let exchange = begin_exchange(
         shared,
         &request,
         destination_class,
         client_profile_id.clone(),
+        replay.as_ref().map(|replay| replay.origin_id),
     );
     let operation = async {
         if request.method() == Method::CONNECT {
@@ -1199,13 +1286,16 @@ fn begin_exchange(
     request: &Request<Incoming>,
     destination_class: DestinationClass,
     client_profile_id: Option<String>,
+    replay_of: Option<u64>,
 ) -> Arc<Exchange> {
+    let replay_template = replay_template(request);
     let mut state = shared.lock().unwrap();
     let id = state.next_id;
     state.next_id += 1;
     if state.traffic.len() == state.limit {
         if let Some(capture) = state.traffic.pop_front() {
             state.breakpoints.remove(&capture.id);
+            state.replay_templates.remove(&capture.id);
             state.request_bodies.remove(capture.id);
             state.response_bodies.remove(capture.id);
         }
@@ -1240,7 +1330,11 @@ fn begin_exchange(
         response_body_error: None,
         breakpoint_state: "none".into(),
         original_status: None,
+        replay_of,
     });
+    if let Some(template) = replay_template {
+        state.replay_templates.insert(id, template);
+    }
     state.status.captures = state.traffic.len();
     state.revision += 1;
     drop(state);
@@ -1249,6 +1343,71 @@ fn begin_exchange(
         id,
         started: Instant::now(),
     })
+}
+
+fn replay_template(request: &Request<Incoming>) -> Option<ReplayTemplate> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD)
+        || !request.body().is_end_stream()
+        || request.uri().scheme_str() != Some("http")
+        || request.uri().authority().is_none()
+    {
+        return None;
+    }
+    let mut headers = request.headers().clone();
+    strip_hop_headers(&mut headers);
+    for name in [
+        HOST.as_str(),
+        "authorization",
+        "cookie",
+        "x-api-key",
+        "content-length",
+        INTERNAL_REPLAY_HEADER,
+    ] {
+        headers.remove(name);
+    }
+    Some(ReplayTemplate {
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        headers,
+    })
+}
+
+async fn replay_through_proxy(
+    address: SocketAddr,
+    token: &str,
+    template: &ReplayTemplate,
+) -> Result<(), String> {
+    let authority = template
+        .uri
+        .authority()
+        .ok_or("Replay target has no authority.")?;
+    let mut request = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\n{}: {}\r\nConnection: close\r\n",
+        template.method, template.uri, authority, INTERNAL_REPLAY_HEADER, token
+    )
+    .into_bytes();
+    for (name, value) in &template.headers {
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    timeout(Duration::from_secs(60), async move {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .map_err(|_| "Cannot connect to the running proxy for replay.")?;
+        stream
+            .write_all(&request)
+            .await
+            .map_err(|_| "Cannot send the replay request to the proxy.")?;
+        tokio::io::copy(&mut stream, &mut tokio::io::sink())
+            .await
+            .map_err(|_| "Replay response transfer failed.")?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Replay did not complete within 60 seconds.")?
 }
 
 type ForwardError = (StatusCode, &'static str);

@@ -179,6 +179,7 @@ impl Tunnel {
                         &request,
                         destination,
                         client_profile_id.clone(),
+                        None,
                     )
                 };
                 let sender = sender.clone();
