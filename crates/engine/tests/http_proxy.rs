@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use sippin_soda_engine::{EnginePhase, ProxyClientAuth, ProxyConfig, ProxyEngine};
+use sippin_soda_engine::{
+    EnginePhase, ProxyClientAuth, ProxyConfig, ProxyEngine, ResponseRuleConfig,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -164,6 +166,90 @@ async fn replay_fails_closed_for_production_and_unsupported_requests() {
     assert!(reply.starts_with("HTTP/1.1 204"));
     let capture = engine.snapshot().traffic[0].clone();
     assert!(engine.replay(capture.id).await.is_err());
+    engine.stop().await;
+}
+
+fn response_rule(id: &str, name: &str, host: &str, path: &str, status: u16) -> ResponseRuleConfig {
+    ResponseRuleConfig {
+        id: id.into(),
+        name: name.into(),
+        enabled: true,
+        host: host.into(),
+        path_prefix: path.into(),
+        method: Some("GET".into()),
+        status,
+    }
+}
+
+#[tokio::test]
+async fn first_matching_development_response_rule_overrides_status() {
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let engine = ProxyEngine::default();
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            response_rules: vec![
+                response_rule("specific", "Teapot API", "127.0.0.1", "/api/", 418),
+                response_rule("fallback", "Fallback", "127.0.0.1", "/", 503),
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/api/items HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 418"));
+    assert!(reply.ends_with("hello"));
+    let capture = &engine.snapshot().traffic[0];
+    assert_eq!(capture.status, Some(418));
+    assert_eq!(capture.original_status, Some(201));
+    assert_eq!(capture.response_rule_id.as_deref(), Some("specific"));
+    assert_eq!(capture.response_rule_name.as_deref(), Some("Teapot API"));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn response_rules_validate_and_never_modify_production() {
+    let engine = ProxyEngine::default();
+    assert!(engine
+        .start(ProxyConfig {
+            port: 0,
+            response_rules: vec![response_rule("bad", "Bad", "127.0.0.1", "api", 199)],
+            ..Default::default()
+        })
+        .await
+        .is_err());
+
+    let (upstream, _) = fixture(
+        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let snapshot = engine
+        .start(ProxyConfig {
+            port: 0,
+            production_hosts: vec!["127.0.0.1".into()],
+            response_rules: vec![response_rule("blocked", "Blocked", "127.0.0.1", "/", 503)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let reply = send(
+        snapshot.status.listen_address.port(),
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 201"));
+    let capture = &engine.snapshot().traffic[0];
+    assert_eq!(capture.response_rule_id, None);
+    assert_eq!(capture.original_status, None);
     engine.stop().await;
 }
 

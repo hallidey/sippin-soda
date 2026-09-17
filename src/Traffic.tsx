@@ -151,7 +151,9 @@ export function Traffic({
                       ? "200 · TLS bridge"
                       : capture.kind === "tunnel" && capture.status === 200
                         ? "200 · Tunnel"
-                        : (capture.status ?? "Pending")}
+                        : capture.responseRuleId
+                          ? `${capture.status ?? "—"} · Rule`
+                          : (capture.status ?? "Pending")}
                 </td>
                 <td>
                   {capture.phase === "pending"
@@ -209,6 +211,11 @@ export function Traffic({
             )}
             {selected.replayOf && (
               <p>Replay of capture #{selected.replayOf}.</p>
+            )}
+            {selected.responseRuleName && (
+              <p className="capture-notice">
+                Response rule applied: {selected.responseRuleName}.
+              </p>
             )}
             <div className="capture-actions">
               <button
@@ -382,7 +389,8 @@ export function Traffic({
                   {selected.status ?? "Waiting"} ·{" "}
                   {selected.responseBytes.toLocaleString()} bytes received
                 </p>
-                {selected.breakpointState === "modified" && (
+                {(selected.breakpointState === "modified" ||
+                  selected.responseRuleId) && (
                   <p>Original upstream status: {selected.originalStatus}.</p>
                 )}
                 {selected.kind === "tunnel" || selected.kind === "tls" ? (

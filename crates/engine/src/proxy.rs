@@ -22,7 +22,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
@@ -84,6 +84,19 @@ pub struct ProxyConfig {
     pub client_auth: Option<ProxyClientAuth>,
     pub tls_interception: Option<ProxyTlsInterception>,
     pub break_on_responses: bool,
+    pub response_rules: Vec<ResponseRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseRuleConfig {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub host: String,
+    pub path_prefix: String,
+    pub method: Option<String>,
+    pub status: u16,
 }
 
 type LeafIssuer =
@@ -242,6 +255,7 @@ impl Default for ProxyConfig {
             client_auth: None,
             tls_interception: None,
             break_on_responses: false,
+            response_rules: vec![],
         }
     }
 }
@@ -270,6 +284,8 @@ pub struct Capture {
     pub breakpoint_state: String,
     pub original_status: Option<u16>,
     pub replay_of: Option<u64>,
+    pub response_rule_id: Option<String>,
+    pub response_rule_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,9 +455,96 @@ struct State {
     request_redaction_paths: Vec<Vec<String>>,
     destination_classifier: DestinationClassifier,
     break_on_responses: bool,
+    response_rules: Vec<ResponseRule>,
     breakpoints: HashMap<u64, oneshot::Sender<BreakpointDecision>>,
     replay_templates: HashMap<u64, ReplayTemplate>,
     replay_tokens: HashMap<String, ReplayAuthorization>,
+}
+
+#[derive(Clone)]
+struct ResponseRule {
+    id: String,
+    name: String,
+    host: HostPattern,
+    path_prefix: String,
+    method: Option<Method>,
+    status: StatusCode,
+}
+
+impl ResponseRule {
+    fn compile_all(configs: &[ResponseRuleConfig]) -> Result<Vec<Self>, String> {
+        if configs.len() > 64 {
+            return Err("At most 64 response rules are allowed.".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        configs
+            .iter()
+            .filter(|config| config.enabled)
+            .map(|config| -> Result<Self, String> {
+                if config.id.is_empty()
+                    || config.id.len() > 128
+                    || !config.id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                    || !ids.insert(config.id.clone())
+                {
+                    return Err("Response rule IDs must be unique safe identifiers up to 128 characters.".into());
+                }
+                let name = config.name.trim();
+                if name.is_empty() || name.len() > 80 {
+                    return Err("Response rule names must use 1-80 bytes.".into());
+                }
+                if !config.path_prefix.starts_with('/') || config.path_prefix.len() > 1024 {
+                    return Err("Response rule path prefixes must begin with '/' and use at most 1024 bytes.".into());
+                }
+                let method = config
+                    .method
+                    .as_deref()
+                    .map(|method| {
+                        if method.is_empty()
+                            || method.len() > 16
+                            || !method.bytes().all(|byte| byte.is_ascii_uppercase())
+                        {
+                            return Err("Response rule methods must be uppercase ASCII tokens.");
+                        }
+                        Method::from_bytes(method.as_bytes())
+                            .map_err(|_| "Response rule method is invalid.")
+                    })
+                    .transpose()?;
+                let status = StatusCode::from_u16(config.status)
+                    .ok()
+                    .filter(|status| {
+                        status.is_success()
+                            || status.is_redirection()
+                            || status.is_client_error()
+                            || status.is_server_error()
+                    })
+                    .ok_or("Response rule status must be between 200 and 599.")?;
+                if matches!(status.as_u16(), 204 | 205 | 304) {
+                    return Err(
+                        "Response rules cannot use body-forbidden status 204, 205 or 304.".into(),
+                    );
+                }
+                Ok(Self {
+                    id: config.id.clone(),
+                    name: name.into(),
+                    host: HostPattern::compile(&config.host)?,
+                    path_prefix: config.path_prefix.clone(),
+                    method,
+                    status,
+                })
+            })
+            .collect()
+    }
+
+    fn matches(&self, host: &str, path: &str, method: &Method) -> bool {
+        self.host.matches(&host.to_ascii_lowercase())
+            && path.starts_with(&self.path_prefix)
+            && self
+                .method
+                .as_ref()
+                .is_none_or(|expected| expected == method)
+    }
 }
 
 #[derive(Clone)]
@@ -493,6 +596,7 @@ impl Default for ProxyEngine {
                 request_redaction_paths: vec![],
                 destination_classifier: DestinationClassifier::default(),
                 break_on_responses: false,
+                response_rules: vec![],
                 breakpoints: HashMap::new(),
                 replay_templates: HashMap::new(),
                 replay_tokens: HashMap::new(),
@@ -813,6 +917,7 @@ impl ProxyEngine {
             bodies::compile_redaction_paths(&config.request_redaction_paths)?;
         let destination_classifier =
             DestinationClassifier::compile(&config.development_hosts, &config.production_hosts)?;
+        let response_rules = ResponseRule::compile_all(&config.response_rules)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))
             .await
             .map_err(|e| format!("Cannot listen on 127.0.0.1:{}: {e}", config.port))?;
@@ -825,6 +930,7 @@ impl ProxyEngine {
             state.request_redaction_paths = request_redaction_paths;
             state.destination_classifier = destination_classifier;
             state.break_on_responses = config.break_on_responses;
+            state.response_rules = response_rules;
             while state.traffic.len() > state.limit {
                 if let Some(capture) = state.traffic.pop_front() {
                     state.breakpoints.remove(&capture.id);
@@ -1331,6 +1437,8 @@ fn begin_exchange(
         breakpoint_state: "none".into(),
         original_status: None,
         replay_of,
+        response_rule_id: None,
+        response_rule_name: None,
     });
     if let Some(template) = replay_template {
         state.replay_templates.insert(id, template);
@@ -1481,6 +1589,14 @@ async fn forward_with_sender(
     authority: Authority,
     connection: Option<ConnectionGuard>,
 ) -> Result<Response<WireBody>, ForwardError> {
+    let rule_method = request.method().clone();
+    let rule_path = request.uri().path().to_owned();
+    let rule_host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     let path: hyper::http::uri::PathAndQuery = request
         .uri()
         .path_and_query()
@@ -1553,6 +1669,32 @@ async fn forward_with_sender(
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream HTTP request failed."))?;
     let (mut parts, body) = upstream.into_parts();
+    let response_rule = {
+        let state = exchange.shared.lock().unwrap();
+        let can_modify = state
+            .traffic
+            .iter()
+            .find(|capture| capture.id == exchange.id)
+            .is_some_and(|capture| authorize(capture.destination_class, Action::Modify).is_ok());
+        can_modify
+            .then(|| {
+                state
+                    .response_rules
+                    .iter()
+                    .find(|rule| rule.matches(&rule_host, &rule_path, &rule_method))
+                    .cloned()
+            })
+            .flatten()
+    };
+    if let Some(rule) = response_rule {
+        let original_status = parts.status.as_u16();
+        parts.status = rule.status;
+        exchange.update(|capture| {
+            capture.original_status = Some(original_status);
+            capture.response_rule_id = Some(rule.id);
+            capture.response_rule_name = Some(rule.name);
+        });
+    }
     let breakpoint = {
         let mut state = exchange.shared.lock().unwrap();
         let enabled = state.break_on_responses
@@ -1572,7 +1714,9 @@ async fn forward_with_sender(
                 .find(|capture| capture.id == exchange.id)
             {
                 capture.breakpoint_state = "waiting".into();
-                capture.original_status = Some(parts.status.as_u16());
+                if capture.original_status.is_none() {
+                    capture.original_status = Some(parts.status.as_u16());
+                }
             }
             state.revision += 1;
             Some(receiver)

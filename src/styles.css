@@ -706,6 +706,69 @@ input:focus-visible {
   color: var(--muted);
   font-size: 12px;
 }
+.rules-panel {
+  padding: 0 32px 32px;
+}
+.rules-toolbar,
+.rule-card-heading,
+.rule-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rules-toolbar {
+  margin-bottom: 20px;
+}
+.rules-toolbar h2,
+.rules-toolbar p {
+  margin: 0 0 6px;
+}
+.rule-list {
+  display: grid;
+  gap: 14px;
+}
+.rule-card {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.rule-card-heading {
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.rule-fields {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1.5fr 0.7fr 0.7fr;
+  gap: 12px;
+}
+.rule-fields label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.rule-fields input,
+.rule-fields select {
+  width: 100%;
+}
+.rule-actions {
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+.rules-footnote {
+  margin-top: 18px;
+}
+.planned-panel.compact {
+  min-height: 230px;
+}
+@media (max-width: 1100px) {
+  .rule-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 .breakpoint-replacement {
   display: grid;
   gap: 10px;

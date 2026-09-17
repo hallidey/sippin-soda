@@ -25,6 +25,8 @@ export type Capture = {
   breakpointState: "none" | "waiting" | "continued" | "modified" | "timed_out";
   originalStatus: number | null;
   replayOf: number | null;
+  responseRuleId: string | null;
+  responseRuleName: string | null;
 };
 
 export type Snapshot = {

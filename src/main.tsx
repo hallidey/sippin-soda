@@ -40,6 +40,15 @@ type ProxyCredential = {
   profileId: string;
   token: string;
 };
+type ResponseRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  host: string;
+  pathPrefix: string;
+  method: "*" | "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
+  status: number;
+};
 type TlsInspectionPreflight = {
   state:
     | "proxy_stopped"
@@ -58,6 +67,7 @@ type TlsInspectionPreflight = {
 };
 
 const clientProfilesKey = "sippin-tls-client-profiles";
+const responseRulesKey = "sippin-response-rules-v1";
 
 function loadClientProfiles(): TlsClientProfile[] {
   try {
@@ -72,6 +82,33 @@ function loadClientProfiles(): TlsClientProfile[] {
         typeof (profile as TlsClientProfile).id === "string" &&
         typeof (profile as TlsClientProfile).name === "string",
     );
+  } catch {
+    return [];
+  }
+}
+
+function loadResponseRules(): ResponseRule[] {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(responseRulesKey) ?? "[]",
+    );
+    if (!Array.isArray(value)) return [];
+    return value
+      .slice(0, 64)
+      .filter(
+        (rule): rule is ResponseRule =>
+          typeof rule === "object" &&
+          rule !== null &&
+          typeof (rule as ResponseRule).id === "string" &&
+          typeof (rule as ResponseRule).name === "string" &&
+          typeof (rule as ResponseRule).enabled === "boolean" &&
+          typeof (rule as ResponseRule).host === "string" &&
+          typeof (rule as ResponseRule).pathPrefix === "string" &&
+          ["*", "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(
+            (rule as ResponseRule).method,
+          ) &&
+          typeof (rule as ResponseRule).status === "number",
+      );
   } catch {
     return [];
   }
@@ -132,6 +169,7 @@ function App() {
   const [redactionPaths, setRedactionPaths] = useState("");
   const [developmentHosts, setDevelopmentHosts] = useState("");
   const [productionHosts, setProductionHosts] = useState("");
+  const [responseRules, setResponseRules] = useState(loadResponseRules);
   const [caStatus, setCaStatus] = useState<CaStatus | null>(null);
   const [caConsent, setCaConsent] = useState(false);
   const [caRemoveConfirmed, setCaRemoveConfirmed] = useState(false);
@@ -175,6 +213,23 @@ function App() {
     parsedProductionHosts.length <= 128 &&
     [...parsedDevelopmentHosts, ...parsedProductionHosts].every(
       hostRuleIsPlausible,
+    );
+  const validResponseRules =
+    responseRules.length <= 64 &&
+    new Set(responseRules.map((rule) => rule.id)).size ===
+      responseRules.length &&
+    responseRules.every(
+      (rule) =>
+        rule.name.trim().length >= 1 &&
+        rule.name.trim().length <= 80 &&
+        hostRuleIsPlausible(rule.host) &&
+        rule.host.length > 0 &&
+        rule.pathPrefix.startsWith("/") &&
+        rule.pathPrefix.length <= 1024 &&
+        Number.isInteger(rule.status) &&
+        rule.status >= 200 &&
+        rule.status <= 599 &&
+        ![204, 205, 304].includes(rule.status),
     );
   const parsedRedactionPaths = redactionPaths
     .split(/[\n,]/)
@@ -242,6 +297,10 @@ function App() {
         clientToken: credential?.token ?? null,
         enableHttpsInspection,
         breakOnResponses,
+        responseRules: responseRules.map((rule) => ({
+          ...rule,
+          method: rule.method === "*" ? null : rule.method,
+        })),
       },
     });
     setProxyCredential(started ? credential : null);
@@ -260,6 +319,9 @@ function App() {
       setSelectedClientId(clientProfiles[0]?.id ?? "");
     }
   }, [clientProfiles, selectedClientId]);
+  useEffect(() => {
+    localStorage.setItem(responseRulesKey, JSON.stringify(responseRules));
+  }, [responseRules]);
   useEffect(() => {
     if (!canRequestHttpsInspection) setEnableHttpsInspection(false);
   }, [canRequestHttpsInspection]);
@@ -405,6 +467,37 @@ function App() {
       setCaBusy(false);
     }
   };
+  const addResponseRule = () => {
+    if (running || responseRules.length >= 64) return;
+    setResponseRules((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        name: `Response rule ${current.length + 1}`,
+        enabled: true,
+        host: "127.0.0.1",
+        pathPrefix: "/",
+        method: "GET",
+        status: 503,
+      },
+    ]);
+  };
+  const updateResponseRule = (id: string, update: Partial<ResponseRule>) => {
+    if (running) return;
+    setResponseRules((current) =>
+      current.map((rule) => (rule.id === id ? { ...rule, ...update } : rule)),
+    );
+  };
+  const moveResponseRule = (index: number, offset: number) => {
+    if (running) return;
+    setResponseRules((current) => {
+      const target = index + offset;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
 
   return (
     <div className="app-shell">
@@ -492,6 +585,7 @@ function App() {
                       !validBudget ||
                       !validRedactionPaths ||
                       !validHostRules ||
+                      !validResponseRules ||
                       (requireClientAuth && !selectedClient) ||
                       (enableHttpsInspection && !canRequestHttpsInspection)))
                 }
@@ -727,6 +821,185 @@ function App() {
               }
             />
           </>
+        ) : section === "Rules" ? (
+          <div className="rules-panel">
+            <div className="rules-toolbar">
+              <div>
+                <h2>Development response rules</h2>
+                <p>
+                  The first enabled rule matching host, path prefix and method
+                  replaces the upstream response status.
+                </p>
+              </div>
+              <button
+                className="primary"
+                disabled={running || responseRules.length >= 64}
+                onClick={addResponseRule}
+              >
+                Add rule
+              </button>
+            </div>
+            {running && (
+              <p className="capture-notice">
+                Rules are locked while the proxy is running. Stop and restart
+                the proxy to apply saved changes.
+              </p>
+            )}
+            {!validResponseRules && (
+              <p className="error" role="alert">
+                Every rule needs a name, a valid exact/wildcard host, a path
+                beginning with / and a body-compatible status from 200 to 599
+                (not 204, 205 or 304).
+              </p>
+            )}
+            {responseRules.length ? (
+              <div className="rule-list">
+                {responseRules.map((rule, index) => (
+                  <article className="rule-card" key={rule.id}>
+                    <div className="rule-card-heading">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={rule.enabled}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              enabled: event.target.checked,
+                            })
+                          }
+                        />{" "}
+                        Enabled
+                      </label>
+                      <span>Priority {index + 1}</span>
+                    </div>
+                    <div className="rule-fields">
+                      <label>
+                        Name
+                        <input
+                          value={rule.name}
+                          maxLength={80}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              name: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Host
+                        <input
+                          value={rule.host}
+                          maxLength={253}
+                          disabled={running}
+                          placeholder="127.0.0.1"
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              host: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Path prefix
+                        <input
+                          value={rule.pathPrefix}
+                          maxLength={1024}
+                          disabled={running}
+                          placeholder="/api/"
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              pathPrefix: event.target.value,
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        Method
+                        <select
+                          value={rule.method}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              method: event.target
+                                .value as ResponseRule["method"],
+                            })
+                          }
+                        >
+                          {[
+                            "*",
+                            "GET",
+                            "HEAD",
+                            "POST",
+                            "PUT",
+                            "PATCH",
+                            "DELETE",
+                          ].map((method) => (
+                            <option key={method} value={method}>
+                              {method === "*" ? "Any" : method}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Return status
+                        <input
+                          type="number"
+                          min="200"
+                          max="599"
+                          value={rule.status}
+                          disabled={running}
+                          onChange={(event) =>
+                            updateResponseRule(rule.id, {
+                              status: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="rule-actions">
+                      <button
+                        disabled={running || index === 0}
+                        onClick={() => moveResponseRule(index, -1)}
+                      >
+                        Move up
+                      </button>
+                      <button
+                        disabled={running || index === responseRules.length - 1}
+                        onClick={() => moveResponseRule(index, 1)}
+                      >
+                        Move down
+                      </button>
+                      <button
+                        disabled={running}
+                        onClick={() =>
+                          setResponseRules((current) =>
+                            current.filter((item) => item.id !== rule.id),
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="planned-panel compact">
+                <span className="eyebrow">NO RULES YET</span>
+                <h2>Turn a repeated response into one click.</h2>
+                <p>
+                  Add a Development-only rule, then start the proxy to apply it.
+                  Rules are saved on this device.
+                </p>
+              </div>
+            )}
+            <p className="muted rules-footnote">
+              Rules never run for Production or Unknown destinations. They
+              currently change only the status; the upstream headers and body
+              remain unchanged.
+            </p>
+          </div>
         ) : section === "Settings" ? (
           <div className="settings-panel">
             <h2>Appearance</h2>

@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use sippin_soda_engine::{
     BodyExportPreview, BodyPage, CaManager, CaStatus, DestinationClass, JsonStatus,
-    ProxyClientAuth, ProxyConfig, ProxyEngine, ProxyTlsInterception, SearchStep, Snapshot,
-    TlsClientIdentity, TlsInspectionPreflight, TlsTrustCheckManager, TlsTrustCheckStatus,
+    ProxyClientAuth, ProxyConfig, ProxyEngine, ProxyTlsInterception, ResponseRuleConfig,
+    SearchStep, Snapshot, TlsClientIdentity, TlsInspectionPreflight, TlsTrustCheckManager,
+    TlsTrustCheckStatus,
 };
 use std::{sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -30,6 +31,8 @@ struct StartProxyOptions {
     client_token: Option<String>,
     enable_https_inspection: bool,
     break_on_responses: bool,
+    #[serde(default)]
+    response_rules: Vec<ResponseRuleConfig>,
 }
 
 #[tauri::command]
@@ -88,6 +91,7 @@ async fn start_proxy(
             client_auth,
             tls_interception,
             break_on_responses: options.break_on_responses,
+            response_rules: options.response_rules,
             ..Default::default()
         })
         .await
