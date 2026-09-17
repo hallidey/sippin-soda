@@ -52,6 +52,17 @@ type ResponseRule = {
   body: string;
   contentType: string;
 };
+type WorkspaceSettings = {
+  port: string;
+  captureBodies: boolean;
+  breakOnResponses: boolean;
+  diskBudget: string;
+  redactionPaths: string;
+  developmentHosts: string;
+  productionHosts: string;
+  requireClientAuth: boolean;
+  selectedClientId: string;
+};
 type TlsInspectionPreflight = {
   state:
     | "proxy_stopped"
@@ -71,6 +82,18 @@ type TlsInspectionPreflight = {
 
 const clientProfilesKey = "sippin-tls-client-profiles";
 const responseRulesKey = "sippin-response-rules-v1";
+const workspaceSettingsKey = "sippin-workspace-settings-v1";
+const defaultWorkspaceSettings: WorkspaceSettings = {
+  port: "8080",
+  captureBodies: false,
+  breakOnResponses: false,
+  diskBudget: "10",
+  redactionPaths: "",
+  developmentHosts: "",
+  productionHosts: "",
+  requireClientAuth: false,
+  selectedClientId: "",
+};
 
 function loadClientProfiles(): TlsClientProfile[] {
   try {
@@ -126,6 +149,59 @@ function loadResponseRules(): ResponseRule[] {
     return [];
   }
 }
+
+function loadWorkspaceSettings(): WorkspaceSettings {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(workspaceSettingsKey) ?? "{}",
+    );
+    if (typeof value !== "object" || value === null) {
+      return defaultWorkspaceSettings;
+    }
+    const stored = value as Partial<WorkspaceSettings>;
+    return {
+      port:
+        typeof stored.port === "string"
+          ? stored.port
+          : defaultWorkspaceSettings.port,
+      captureBodies:
+        typeof stored.captureBodies === "boolean"
+          ? stored.captureBodies
+          : defaultWorkspaceSettings.captureBodies,
+      breakOnResponses:
+        typeof stored.breakOnResponses === "boolean"
+          ? stored.breakOnResponses
+          : defaultWorkspaceSettings.breakOnResponses,
+      diskBudget:
+        typeof stored.diskBudget === "string"
+          ? stored.diskBudget
+          : defaultWorkspaceSettings.diskBudget,
+      redactionPaths:
+        typeof stored.redactionPaths === "string"
+          ? stored.redactionPaths
+          : defaultWorkspaceSettings.redactionPaths,
+      developmentHosts:
+        typeof stored.developmentHosts === "string"
+          ? stored.developmentHosts
+          : defaultWorkspaceSettings.developmentHosts,
+      productionHosts:
+        typeof stored.productionHosts === "string"
+          ? stored.productionHosts
+          : defaultWorkspaceSettings.productionHosts,
+      requireClientAuth:
+        typeof stored.requireClientAuth === "boolean"
+          ? stored.requireClientAuth
+          : defaultWorkspaceSettings.requireClientAuth,
+      selectedClientId:
+        typeof stored.selectedClientId === "string"
+          ? stored.selectedClientId
+          : defaultWorkspaceSettings.selectedClientId,
+    };
+  } catch {
+    return defaultWorkspaceSettings;
+  }
+}
+const initialWorkspaceSettings = loadWorkspaceSettings();
 const descriptions: Record<Section, string> = {
   Traffic: "Your application’s traffic, in one place.",
   Collections: "Compose requests and keep repeatable workflows together.",
@@ -175,13 +251,25 @@ function App() {
   const { snapshot, error, busy, command, desktop } = useEngine();
   const status = snapshot?.status;
   const running = status?.phase === "running";
-  const [port, setPort] = useState("8080");
-  const [captureBodies, setCaptureBodies] = useState(false);
-  const [breakOnResponses, setBreakOnResponses] = useState(false);
-  const [diskBudget, setDiskBudget] = useState("10");
-  const [redactionPaths, setRedactionPaths] = useState("");
-  const [developmentHosts, setDevelopmentHosts] = useState("");
-  const [productionHosts, setProductionHosts] = useState("");
+  const [port, setPort] = useState(initialWorkspaceSettings.port);
+  const [captureBodies, setCaptureBodies] = useState(
+    initialWorkspaceSettings.captureBodies,
+  );
+  const [breakOnResponses, setBreakOnResponses] = useState(
+    initialWorkspaceSettings.breakOnResponses,
+  );
+  const [diskBudget, setDiskBudget] = useState(
+    initialWorkspaceSettings.diskBudget,
+  );
+  const [redactionPaths, setRedactionPaths] = useState(
+    initialWorkspaceSettings.redactionPaths,
+  );
+  const [developmentHosts, setDevelopmentHosts] = useState(
+    initialWorkspaceSettings.developmentHosts,
+  );
+  const [productionHosts, setProductionHosts] = useState(
+    initialWorkspaceSettings.productionHosts,
+  );
   const [responseRules, setResponseRules] = useState(loadResponseRules);
   const [caStatus, setCaStatus] = useState<CaStatus | null>(null);
   const [caConsent, setCaConsent] = useState(false);
@@ -194,11 +282,17 @@ function App() {
   const [trustCheckConsent, setTrustCheckConsent] = useState(false);
   const [trustCheckBusy, setTrustCheckBusy] = useState(false);
   const [clientProfiles, setClientProfiles] = useState(loadClientProfiles);
-  const [selectedClientId, setSelectedClientId] = useState(
-    () => loadClientProfiles()[0]?.id ?? "",
+  const [selectedClientId, setSelectedClientId] = useState(() =>
+    loadClientProfiles().some(
+      (profile) => profile.id === initialWorkspaceSettings.selectedClientId,
+    )
+      ? initialWorkspaceSettings.selectedClientId
+      : (loadClientProfiles()[0]?.id ?? ""),
   );
   const [newClientName, setNewClientName] = useState("");
-  const [requireClientAuth, setRequireClientAuth] = useState(false);
+  const [requireClientAuth, setRequireClientAuth] = useState(
+    initialWorkspaceSettings.requireClientAuth,
+  );
   const [enableHttpsInspection, setEnableHttpsInspection] = useState(false);
   const [proxyCredential, setProxyCredential] =
     useState<ProxyCredential | null>(null);
@@ -284,7 +378,7 @@ function App() {
     client_mismatch:
       "The authenticated proxy profile does not match the verified client.",
     ready:
-      "Proxy identity and TLS trust proof match. Listener integration is not active yet.",
+      "Proxy identity and TLS trust proof match for Development HTTPS inspection.",
   };
 
   const createClientToken = () => {
@@ -347,6 +441,43 @@ function App() {
   useEffect(() => {
     localStorage.setItem(responseRulesKey, JSON.stringify(responseRules));
   }, [responseRules]);
+  useEffect(() => {
+    if (!validPort || !validBudget || !validRedactionPaths || !validHostRules) {
+      return;
+    }
+    try {
+      localStorage.setItem(
+        workspaceSettingsKey,
+        JSON.stringify({
+          port,
+          captureBodies,
+          breakOnResponses,
+          diskBudget,
+          redactionPaths,
+          developmentHosts,
+          productionHosts,
+          requireClientAuth,
+          selectedClientId,
+        } satisfies WorkspaceSettings),
+      );
+    } catch {
+      // The controls remain usable for this run when webview storage is unavailable.
+    }
+  }, [
+    port,
+    captureBodies,
+    breakOnResponses,
+    diskBudget,
+    redactionPaths,
+    developmentHosts,
+    productionHosts,
+    requireClientAuth,
+    selectedClientId,
+    validPort,
+    validBudget,
+    validRedactionPaths,
+    validHostRules,
+  ]);
   useEffect(() => {
     if (!canRequestHttpsInspection) setEnableHttpsInspection(false);
   }, [canRequestHttpsInspection]);
@@ -526,6 +657,19 @@ function App() {
       return next;
     });
   };
+  const resetWorkspaceSettings = () => {
+    if (running) return;
+    setPort(defaultWorkspaceSettings.port);
+    setCaptureBodies(defaultWorkspaceSettings.captureBodies);
+    setBreakOnResponses(defaultWorkspaceSettings.breakOnResponses);
+    setDiskBudget(defaultWorkspaceSettings.diskBudget);
+    setRedactionPaths(defaultWorkspaceSettings.redactionPaths);
+    setDevelopmentHosts(defaultWorkspaceSettings.developmentHosts);
+    setProductionHosts(defaultWorkspaceSettings.productionHosts);
+    setRequireClientAuth(defaultWorkspaceSettings.requireClientAuth);
+    setSelectedClientId(clientProfiles[0]?.id ?? "");
+    setEnableHttpsInspection(false);
+  };
 
   return (
     <div className="app-shell">
@@ -695,8 +839,8 @@ function App() {
                     }
                   />{" "}
                   Explicitly enable TLS termination for authenticated
-                  Development CONNECT destinations. HTTPS request contents are
-                  not captured yet.
+                  Development CONNECT destinations and inspect their negotiated
+                  HTTP/1.1 or HTTP/2 exchanges.
                 </label>
               )}
               {running && proxyCredential && (
@@ -736,7 +880,7 @@ function App() {
                   </strong>
                   <p>
                     {tlsPreflight.httpsInspectionActive
-                      ? "Development CONNECT destinations now use the verified TLS transport bridge. Inner HTTP capture is not active yet."
+                      ? "Development CONNECT destinations use the verified TLS bridge with inner HTTP capture."
                       : preflightMessage[tlsPreflight.state]}
                   </p>
                   {tlsPreflight.proofExpiresAt && (
@@ -1119,7 +1263,7 @@ function App() {
               <dt>Inspection preflight</dt>
               <dd>
                 {tlsPreflight
-                  ? `${tlsPreflight.state} · HTTPS inspection inactive`
+                  ? `${tlsPreflight.state} · HTTPS inspection ${tlsPreflight.httpsInspectionActive ? "active" : "inactive"}`
                   : "Unavailable"}
               </dd>
               <dt>Production policy</dt>
@@ -1129,6 +1273,15 @@ function App() {
                   : "Read-only by design"}
               </dd>
             </dl>
+            <button disabled={running || busy} onClick={resetWorkspaceSettings}>
+              Reset saved proxy settings
+            </button>
+            <p className="muted">
+              Port, capture options, redaction paths, destination rules and the
+              selected authentication profile are saved only in this local
+              workspace. Ephemeral passwords and HTTPS inspection consent are
+              never persisted.
+            </p>
             <div className="settings-divider" />
             <h2>HTTPS inspection foundation</h2>
             <p>

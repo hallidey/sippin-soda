@@ -17,6 +17,8 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 http://127.0.0.1:9090/slow
 
 On Windows PowerShell use `curl.exe` if `curl` is an alias. `--noproxy ""` prevents a client's localhost bypass from skipping the proxy. Select a request to view request/response headers, status, timing and byte counts. The fixture is a real HTTP server; the application does not manufacture traffic rows.
 
+The desktop saves valid, non-secret workspace choices locally: port, body recording, breakpoint toggle, disk budget, redaction paths, Development/Production hosts, authentication requirement and selected client profile. It never saves the ephemeral proxy password or the per-run HTTPS inspection opt-in. Settings provides a reset action, and the proxy never starts automatically after an app restart.
+
 Optionally enable **Require client profile authentication** and select a configured client before Start. Each run gets a new 256-bit password shown only while that proxy is running. Configure HTTP Basic proxy credentials using the displayed profile ID as username and password as token; for curl, add `--proxy-user "<profile-id>:<token>"`. Missing or invalid credentials receive 407 and are rejected before capture, DNS or upstream access. Accepted captures show the non-secret profile ID. Stop discards the credential.
 
 **Stop proxy** stops accepting connections and cancels active transfers, retaining captures for inspection. Normal desktop exit stops the engine and clears captures. **Clear** removes metadata and temporary body files and cancels their recording, without stopping forwarding.
