@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add an unsigned, per-user Windows NSIS installer with Italian/English localization and a manual artifact workflow.
 - Persist validated non-secret proxy workspace settings locally across app restarts, with an explicit reset action; ephemeral credentials and HTTPS inspection opt-in remain per-run.
 - Add ordered Development-only response rules for host/path/method matching, bounded status/body replacement and visible applied-rule metadata.
 - Add safe same-target replay for completed bodyless Development HTTP GET/HEAD captures without built-in credential headers.
@@ -25,4 +26,4 @@
 - Add navigation, theme preferences and an explicit empty traffic state.
 - Configure native CI checks for Windows, macOS and Linux.
 
-This remains a desktop development preview. Installer packaging, portable sessions, edit/session replay and advanced rule actions are not available yet.
+This remains a desktop development preview. Installer signing, portable sessions, edit/session replay and advanced rule actions are not available yet.

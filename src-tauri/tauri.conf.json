@@ -24,5 +24,27 @@
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:"
     }
   },
-  "bundle": { "active": false }
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Alessandro Fedele",
+    "homepage": "https://github.com/Alessandro-Fedele/sippin-soda",
+    "copyright": "Copyright © 2026 Alessandro Fedele",
+    "license": "MIT",
+    "category": "DeveloperTool",
+    "shortDescription": "Programmable network layer for local development",
+    "longDescription": "Observe, intercept, modify, replay and mock application traffic from a local-first desktop proxy.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "Italian"],
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico"
+      }
+    }
+  }
 }

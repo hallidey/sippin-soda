@@ -25,7 +25,9 @@ npm run desktop
 
 The npm desktop/test commands also recognize an optional local Rust installation under `.tools/cargo` and `.tools/rustup`, without modifying the system PATH. Otherwise they use the normal installed Rust toolchain. Stop an existing `npm run dev` preview before starting `npm run desktop`, since both use port 1420.
 
-`npm run dev` previews the UI in a browser for development only; capture controls require the native app. `npm run build` typechecks and builds the frontend. `cargo test -p sippin-soda-engine` runs policy and real HTTP integration tests. `npm run benchmark:tls` runs the opt-in release benchmark for pass-through versus verified TLS and prints a JSON report; it is excluded from normal tests. `npm run tauri -- build --no-bundle` compiles the desktop application; installer packaging/signing is a later milestone.
+`npm run dev` previews the UI in a browser for development only; capture controls require the native app. `npm run build` typechecks and builds the frontend. `cargo test -p sippin-soda-engine` runs policy and real HTTP integration tests. `npm run benchmark:tls` runs the opt-in release benchmark for pass-through versus verified TLS and prints a JSON report; it is excluded from normal tests. `npm run tauri -- build --no-bundle` compiles the desktop application without packaging it.
+
+On Windows, `npm run package:windows` creates a per-user NSIS installer under `target/release/bundle/nsis/`. The installer does not require administrator access, uses the operating-system language when Italian or English is available, and downloads WebView2 only when the runtime is missing. Development installers are currently unsigned; see the [Windows installation guide](docs/INSTALL_WINDOWS.md) before distributing them.
 
 ## Structure
 
